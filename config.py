@@ -9,7 +9,7 @@ HOST          = "0.0.0.0"      # 0.0.0.0 = reachable on your WiFi/LAN. "127.0.0.
 OPEN_BROWSER  = True
 
 # ── How often each group refreshes (minutes). Everything also refreshes on every launch. ──
-REFRESH_MINUTES = {"news": 10, "exploits": 45, "github": 30, "rf": 15, "meta": 30}
+REFRESH_MINUTES = {"news": 10, "exploits": 45, "github": 30, "rf": 15, "meta": 30, "threats": 20, "intel": 60}
 
 # ── Your stack: items mentioning these get a "MY STACK" badge + filter ──
 KEYWORDS = ["apache", "nginx", "fortinet", "fortigate", "cisco", "palo alto", "openssl", "log4j",
@@ -23,6 +23,9 @@ LOCKOUT_MINUTES = 5        # ... before that device is locked out for this long
 
 # ── Optional keys (config value, or the environment variable). Everything works without them. ──
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")   # free; makes GitHub refresh much faster (30 vs 10 searches/min)
+ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY", "")            # free (abuse.ch account): unlocks ThreatFox + URLhaus IOC feeds
+RANSOMWARE_KEY = os.getenv("RANSOMWARE_LIVE_API_KEY", "")   # free (my.ransomware.live): unlocks the Ransomware tab
+GREYNOISE_KEY = os.getenv("GREYNOISE_API_KEY", "")          # optional: richer IP lookup
 
 # Recorded Future: leave token empty = feature OFF. With a token, an "RF Intelligence" panel appears
 # (risk-scored vulnerabilities + your triggered alerts).  Keep the token private.
@@ -32,6 +35,15 @@ RECORDED_FUTURE = {
     "alert_days": 7,       # alerts triggered in the last N days
     "alert_params": {},    # extra /v2/alert/search filters
 }
+
+# Your own software, checked against OSV.dev (free, no key). Ecosystems: PyPI, npm, Go, Maven, crates.io, RubyGems, NuGet ...
+PACKAGES = [
+    # {"ecosystem": "PyPI", "name": "django", "version": "4.2.0"},
+    # {"ecosystem": "npm",  "name": "express", "version": "4.17.1"},
+]
+
+# Push brand-new high-priority items to a chat webhook (Slack / Teams / Discord incoming-webhook URL). "" = off.
+ALERTS = {"webhook": "", "min_priority": 70}
 
 # ── Content ────────────────────────────────────────────
 NEWS_DAYS = 10             # drop articles older than this
