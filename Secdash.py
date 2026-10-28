@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Secdash: one script. Starts every collector in the background, serves the dashboard on a random port
 reachable on your WiFi behind an access code. Standard library only.   Usage: python run.py"""
-import atexit, csv, ipaddress, hashlib, html, io, json, os, random, re, secrets, socket, sys, threading, time, webbrowser
+import atexit, csv, ipaddress, ssl, hashlib, html, io, json, os, random, re, secrets, socket, sys, threading, time, webbrowser
 import urllib.error, urllib.request, xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -14,8 +14,8 @@ import config as C
 UA = "secdash/2.0 (+local dashboard)"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secdash_state.json")
 LOCK = threading.RLock()
-ITEMS, STATUS, META = {}, {}, {"infocon": "n/a"}   # per-source items, per-source health, misc
-KEV_IDS, MSF_IDS, EDB_IDS, NUC_IDS = set(), set(), set(), set()
+ITEMS, STATUS = {}, {}   # per-source items, per-source health
+KEV_IDS, MSF_IDS, EDB_IDS, NUC_IDS, SIG_IDS = set(), set(), set(), set(), set()
 STATE = {"v": 0, "data": b"{}", "obj": None}
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
 SEC_RE = re.compile(r"secur|vuln|exploit|pentest|red.?team|malware|ransom|\bcve|forensic|dfir|osint|phish|fuzz|reverse.?eng|"
@@ -24,11 +24,24 @@ SEC_RE = re.compile(r"secur|vuln|exploit|pentest|red.?team|malware|ransom|\bcve|
 TOKEN = C.GITHUB_TOKEN
 RF = C.RECORDED_FUTURE
 GH_SLEEP = 2.2 if TOKEN else 6.5
+TLS = getattr(C, "TLS", None) or {}               # HTTPS for the dashboard itself: {"cert": "...pem", "key": "...key", "password": "", "hostname": ""}
+VERIFY_SSL = getattr(C, "VERIFY_SSL", True)       # verify certificates on outgoing requests (feeds, GitHub, APIs)
+CA_BUNDLE = getattr(C, "CA_BUNDLE", "")           # extra root CA (.pem), e.g. your company / Citrix proxy that re-signs HTTPS
+
+def make_ctx():
+    ctx = ssl.create_default_context()
+    if not VERIFY_SSL:
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    elif CA_BUNDLE:
+        ctx.load_verify_locations(cafile=CA_BUNDLE)   # adds to the system trust store
+    return ctx
+CTX = make_ctx()
+TLS_CTX = None
 
 # ───────────── helpers ─────────────
 def http(url, headers=None, data=None, timeout=40, cap=40_000_000):
     req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, "Accept-Encoding": "identity", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
         b = r.read(cap + 1)
     if len(b) > cap:
         raise ValueError("response too large")
@@ -161,6 +174,22 @@ def nuclei():
     NUC_IDS = ids
     return [], f"{len(ids)} CVEs have a ready Nuclei template"
 
+def sigma():
+    """Which CVEs already have a community Sigma detection rule (SigmaHQ), found from rule file names."""
+    global SIG_IDS
+    for br in ("master", "main"):
+        try:
+            tree = json.loads(http(f"https://api.github.com/repos/SigmaHQ/sigma/git/trees/{br}?recursive=1", GH_H)).get("tree", [])
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 404: raise
+    else:
+        raise RuntimeError("Sigma repository tree not found")
+    ids = {f"CVE-{y}-{n}" for t in tree for y, n in re.findall(r"cve[-_](\d{4})[-_](\d{4,7})", t["path"], re.I)}
+    if not ids: raise RuntimeError("no CVE-named Sigma rules found")
+    SIG_IDS = ids
+    return [], f"{len(ids)} CVEs have a Sigma detection rule"
+
 def packet():
     out = []
     for name, url in C.EXPLOIT_FEEDS:
@@ -180,7 +209,7 @@ def gh(q, sort="stars", n=30, tries=3):
                 time.sleep(min(GH["reset"] - time.time() + 1, 70))
             GH["last"] = time.time()
             try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=40) as r:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=40, context=CTX) as r:
                     GH.update(remaining=int(r.headers.get("X-RateLimit-Remaining", -1)), limit=int(r.headers.get("X-RateLimit-Limit", 0)),
                               reset=int(r.headers.get("X-RateLimit-Reset", 0)))
                     return json.loads(r.read()).get("items", [])
@@ -414,16 +443,11 @@ def rf_alerts():
                r.get("url") or "https://app.recordedfuture.com", ts(r.get("triggered")), (r.get("rule") or {}).get("name", ""),
                status=(r.get("review") or {}).get("status", "")) for r in res], f"{len(res)} alerts"
 
-def infocon():
-    META["infocon"] = json.loads(http("https://isc.sans.edu/api/infocon?json")).get("status", "n/a")
-    return [], f"level {META['infocon']}"
-
 # (group, name, function, minimum minutes between runs of heavy sources)
 SOURCES = [("news", "News feeds", feeds, 0), ("news", "Hacker News", hn, 0),
            ("exploits", "CISA KEV", kev, 0), ("exploits", "Exploit-DB", edb, 120), ("exploits", "Metasploit", msf, 120),
-           ("exploits", "Nuclei templates", nuclei, 360), ("exploits", "Packet Storm", packet, 0), ("exploits", "GitHub PoCs", ghpoc, 0), ("exploits", "GitHub advisories", ghsa, 0), ("exploits", "EPSS scores", epss, 0),
+           ("exploits", "Nuclei templates", nuclei, 360), ("exploits", "Sigma rules", sigma, 360), ("exploits", "Packet Storm", packet, 0), ("exploits", "GitHub PoCs", ghpoc, 0), ("exploits", "GitHub advisories", ghsa, 0), ("exploits", "EPSS scores", epss, 0),
            ("github", "GitHub rising", rising, 0), ("github", "GitHub trending", trending, 0), ("github", "GitHub active", active, 0),
-           ("meta", "InfoCon", infocon, 0),
            ("threats", "Feodo C2", feodo, 0), ("threats", "ThreatFox", threatfox, 0), ("threats", "URLhaus", urlhaus, 0),
            ("threats", "Ransomware victims", ransomware, 0), ("threats", "Breaches (HIBP)", breaches, 60),
            ("intel", "Threat actors (MITRE)", actors, 1440), ("intel", "My dependencies (OSV)", osv, 0)]
@@ -466,7 +490,7 @@ def publish():
         now, news, ex, repos, rfv, rfa = time.time(), [], [], {}, [], []
         oth, acount = {"ioc": [], "ransom": [], "breach": [], "dep": []}, {}
         kw = [k.lower() for k in C.KEYWORDS if len(k) > 2]
-        sets = (("KEV", KEV_IDS), ("MSF", MSF_IDS), ("EDB", EDB_IDS), ("NUC", NUC_IDS))
+        sets = (("KEV", KEV_IDS), ("MSF", MSF_IDS), ("EDB", EDB_IDS), ("NUC", NUC_IDS), ("SIG", SIG_IDS))
         for items in ITEMS.values():
             for it in items:
                 if it["id"] not in SEEN:
@@ -507,11 +531,11 @@ def publish():
         for it in news + ex:
             for c in it["cves"]:
                 mentions.setdefault(c, {"src": set(), "t": it["title"]})["src"].add(it["src"])
-        hot = sorted(({"cve": c, "n": len(v["src"]), "kev": c in KEV_IDS, "msf": c in MSF_IDS, "edb": c in EDB_IDS, "nuc": c in NUC_IDS, "t": v["t"]}
+        hot = sorted(({"cve": c, "n": len(v["src"]), "kev": c in KEV_IDS, "msf": c in MSF_IDS, "edb": c in EDB_IDS, "nuc": c in NUC_IDS, "sig": c in SIG_IDS, "t": v["t"]}
                       for c, v in mentions.items() if len(v["src"]) >= 2 or (c in KEV_IDS or c in MSF_IDS)),
                      key=lambda h: (h["kev"], h["n"], h["msf"]), reverse=True)[:14]
         acts = [{"name": a, "n": n, "url": ACT["by"].get(a, "")} for a, n in sorted(acount.items(), key=lambda kv: -kv[1])[:12]]
-        payload = {"v": STATE["v"] + 1, "now": int(now), "run_start": RUN_START, "first_run": FIRST_RUN, "infocon": META["infocon"],
+        payload = {"v": STATE["v"] + 1, "now": int(now), "run_start": RUN_START, "first_run": FIRST_RUN,
                    "rf_on": bool(RF.get("token")), "status": STATUS, "hot": hot, "actors": acts, "news": news[:250], "exploits": ex[:250],
                    "repos": list(repos.values()), "rf": {"vulns": rfv, "alerts": rfa}, "triage": TRIAGE,
                    "ioc": oth["ioc"][:150], "ransom": oth["ransom"][:150], "breach": oth["breach"][:60], "deps": oth["dep"],
@@ -539,7 +563,7 @@ def brief(P, slack=False):
             bits.append(tg["status"] + (f" · {tg['owner']}" if tg.get("owner") else ""))
         return f"{L(i)} ({', '.join(bits)})" + (f' — "{tg["note"][:140]}"' if tg.get("note") else "")
     day = time.strftime("%Y-%m-%d", time.localtime(P["now"]))
-    out = [B(f"Threat brief {day}") if slack else f"# Threat brief {day}", f"InfoCon: {P['infocon']}"]
+    out = [B(f"Threat brief {day}") if slack else f"# Threat brief {day}"]
     def sec(title, rows):
         if rows: out.extend(["", B(title), *[("• " if slack else "- ") + line(i) for i in rows]])
     allx = P["exploits"] + P["news"]
@@ -553,7 +577,7 @@ def brief(P, slack=False):
     sec("Exploited in the wild", top([i for i in P["exploits"] if i["kind"] == "itw"], 8))
     sec("New public exploits", [i for i in P["exploits"] if i["kind"] == "public"][:6])
     if P["hot"]:
-        out.extend(["", B("Hot CVEs")] + [("• " if slack else "- ") + f'{h["cve"]} ({h["n"]} sources' + "".join(", " + k.upper() for k in ("kev", "msf", "edb", "nuc") if h[k]) + ")" for h in P["hot"][:8]])
+        out.extend(["", B("Hot CVEs")] + [("• " if slack else "- ") + f'{h["cve"]} ({h["n"]} sources' + "".join(", " + k.upper() for k in ("kev", "msf", "edb", "nuc", "sig") if h[k]) + ")" for h in P["hot"][:8]])
     rr = sorted((r for r in P["repos"] if "rising" in r["m"]["kinds"]), key=lambda r: -(r["m"].get("per_day") or 0))[:5]
     if rr: out.extend(["", B("Rising security repos")] + [("• " if slack else "- ") + f'{L(r)} ({r["m"].get("stars", 0)}★, {r["m"].get("per_day", 0)}/day)' for r in rr])
     if P.get("actors"): out.extend(["", B("Threat actors in the news")] + [("• " if slack else "- ") + f'{a["name"]} ({a["n"]} articles)' for a in P["actors"][:8]])
@@ -571,7 +595,7 @@ def to_csv(P):
                                          " ".join(i["cves"]), " ".join(i["flags"]), i.get("p", ""), "yes" if i["mine"] else "", tg.get("status", ""), tg.get("owner", ""), tg.get("note", "")]])
     return buf.getvalue()
 
-KICK = {g: threading.Event() for g in C.REFRESH_MINUTES}
+KICK = {g: threading.Event() for g in {x[0] for x in SOURCES}}
 LAST = {}
 
 def run_group(group):
@@ -592,19 +616,28 @@ def run_group(group):
                     STATUS[name] = {"ok": 0, "msg": f"{type(e).__name__}: {str(e)[:120]}", "ts": int(time.time())}
             print(f"  [{['FAIL', 'ok  ', 'skip'][STATUS[name]['ok']]}] {name}: {STATUS[name]['msg']}", flush=True)
             publish()
-        KICK[group].wait(C.REFRESH_MINUTES[group] * 60); KICK[group].clear()
+        KICK[group].wait(C.REFRESH_MINUTES.get(group, 30) * 60); KICK[group].clear()
 
 # ───────────── web server ─────────────
 CODE = (C.ACCESS_CODE or "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(6))).upper()
 SESSIONS, FAILS = {}, {}
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    def handle_error(self, request, client_address): pass   # port scanners / bad TLS handshakes: stay quiet
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def setup(self):
+        if TLS_CTX:   # TLS handshake happens here, in the request's own thread (a slow client can't block the server)
+            self.request.settimeout(15)
+            self.request = TLS_CTX.wrap_socket(self.request, server_side=True)
+        super().setup()
     def out(self, code, body, ctype="application/json", extra=()):
         b = body if isinstance(body, bytes) else body.encode()
         self.send_response(code)
         for k, v in (("Content-Type", ctype + "; charset=utf-8"), ("Content-Length", str(len(b))), ("Cache-Control", "no-store"),
-                     ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer"), *extra):
+                     ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer"), *(("Strict-Transport-Security", "max-age=31536000"),) * bool(TLS_CTX), *extra):
             self.send_header(k, v)
         self.end_headers(); self.wfile.write(b)
     def page(self, src, code=200):
@@ -621,7 +654,7 @@ class H(BaseHTTPRequestHandler):
         if secrets.compare_digest(code.strip().upper().encode(), CODE.encode()):
             t = secrets.token_urlsafe(24); SESSIONS[t] = now + 86400
             for k in [k for k, e in SESSIONS.items() if e < now]: del SESSIONS[k]
-            return ("Set-Cookie", f"sd={t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400")
+            return ("Set-Cookie", f"sd={t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400" + ("; Secure" if TLS_CTX else ""))
         FAILS[ip].append(now); return False
     def do_GET(self):
         u = urlparse(self.path)
@@ -636,7 +669,7 @@ class H(BaseHTTPRequestHandler):
             f, dl, day = q.get("fmt", ["md"])[0], q.get("dl"), time.strftime("%Y%m%d")
             body, ct, ext = {"md": (brief(P), "text/plain", "md"), "slack": (brief(P, True), "text/plain", "txt"),
                              "csv": (to_csv(P), "text/csv", "csv"),
-                             "json": (json.dumps({k: P[k] for k in ("now", "infocon", "hot", "news", "exploits", "repos", "triage")}, indent=1), "application/json", "json")}.get(f, (None,) * 3)
+                             "json": (json.dumps({k: P[k] for k in ("now", "hot", "news", "exploits", "repos", "triage")}, indent=1), "application/json", "json")}.get(f, (None,) * 3)
             if body is None: return self.out(400, "bad fmt", "text/plain")
             return self.out(200, body, ct, [("Content-Disposition", f'attachment; filename="threat-{day}.{ext}"')] if dl else [])
         if u.path == "/api/lookup":
@@ -691,24 +724,38 @@ def lan_ip():
     except Exception:
         return "127.0.0.1"
 
+def build_tls():
+    global TLS_CTX
+    if not TLS.get("cert"): return
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(TLS["cert"], TLS.get("key") or None, TLS.get("password") or None)
+    except Exception as e:
+        sys.exit(f"\n  ✕ Could not load your TLS certificate ({TLS['cert']}): {e}\n    Check TLS in config.py (cert = PEM file, key = PEM private key).")
+    TLS_CTX = ctx
+
 def main():
+    build_tls()
     srv = None
     for _ in range(80):
         port = C.PORT or random.randint(*C.PORT_RANGE)
         try:
-            srv = ThreadingHTTPServer((C.HOST, port), H); break
+            srv = Server((C.HOST, port), H); break
         except OSError:
             if C.PORT: sys.exit(f"Port {port} is busy.")
     if not srv: sys.exit("Could not find a free port.")
-    srv.daemon_threads = True
-    for g in {s[0] for s in SOURCES}:
+    for g in {x[0] for x in SOURCES}:
         threading.Thread(target=run_group, args=(g,), daemon=True).start()
-    lan = lan_ip()
-    print(f"\n  ┌─ SECDASH ─ live {'(first run: nothing is flagged NEW yet)' if FIRST_RUN else ''}\n  │ This machine : http://127.0.0.1:{port}/?code={CODE}")
-    if C.HOST != "127.0.0.1": print(f"  │ On your WiFi : http://{lan}:{port}/      access code: {CODE}")
-    print(f"  └─ Recorded Future: {'ON' if RF.get('token') else 'off (set RF token in config.py)'}   ·   plain HTTP: keep it on a trusted network\n")
+    sch, lan = ("https" if TLS_CTX else "http"), lan_ip()
+    name = TLS.get("hostname") or lan
+    print(f"\n  ┌─ SECDASH ─ live {'(first run: nothing is flagged NEW yet)' if FIRST_RUN else ''}\n  │ This machine : {sch}://127.0.0.1:{port}/?code={CODE}")
+    if C.HOST != "127.0.0.1": print(f"  │ On your WiFi : {sch}://{name}:{port}/      access code: {CODE}")
+    print(f"  │ Recorded Future: {'ON' if RF.get('token') else 'off (set RF token in config.py)'}")
+    print(f"  │ Dashboard TLS  : {'ON (HTTPS)' if TLS_CTX else 'off (plain HTTP: keep it on a trusted network, or set TLS in config.py)'}")
+    print(f"  └─ Outgoing TLS  : {'verified' + (' + custom CA' if CA_BUNDLE else '') if VERIFY_SSL else 'NOT VERIFIED (VERIFY_SSL = False)'}\n")
     if C.OPEN_BROWSER:
-        threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}/?code={CODE}")).start()
+        threading.Timer(1.5, lambda: webbrowser.open(f"{sch}://127.0.0.1:{port}/?code={CODE}")).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -730,11 +777,11 @@ button{margin-top:14px;width:100%;padding:12px;border:0;border-radius:8px;font:7
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark"><title>Secdash</title><style>
-:root{color-scheme:dark;--bg:#000;--p:#070707;--p2:#101010;--bd:#262626;--fg:#fff;--mut:#a6a6a6;--or:#ff7a00;--or2:#ffa040;--red:#ff3d2e;--amb:#ffb020;--grn:#35d07f;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+:root{color-scheme:dark;--bg:#000;--p:#060606;--p2:#0c0c0c;--bd:#1f1f1f;--fg:#e6e6e6;--hd:#fff;--mut:#9a9a9a;--or:#ff7a00;--or2:#ffa040;--red:#ff3d2e;--amb:#ffb020;--grn:#35d07f;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
-body{margin:0;background:#000;color:var(--fg);font:14.5px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;scrollbar-color:#333 #000}
-a{color:var(--fg);text-decoration:none}a:hover{color:var(--or)}:focus-visible{outline:2px solid var(--or);outline-offset:2px}
-header{position:sticky;top:0;z-index:5;background:#000;border-bottom:1px solid var(--bd);padding:8px 18px;display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center}
+body{margin:0;background:#000;color:var(--fg);font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100vh;scrollbar-color:#333 #000}
+a{color:inherit;text-decoration:none}a:hover{color:var(--or)}:focus-visible{outline:2px solid var(--or);outline-offset:2px}
+header{position:sticky;top:0;z-index:5;background:#000;border-bottom:1px solid var(--bd);padding:10px 28px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
 .logo{font-weight:900;letter-spacing:.22em;font-size:17px;color:var(--or);text-shadow:0 0 18px #ff7a0066}
 nav{display:flex;gap:4px;flex-wrap:wrap}nav button{border:0;background:transparent;color:var(--mut);padding:6px 12px;font-weight:600}nav button:hover{color:#fff}nav button.on{background:var(--or);color:#000}
 i{font-style:normal}nav i,.tbs i{font:700 10.5px var(--mono);background:#ffffff24;border-radius:999px;padding:0 6px;margin-left:4px}nav .on i,.tbs .on i{background:#0003}
@@ -745,49 +792,68 @@ i{font-style:normal}nav i,.tbs i{font:700 10.5px var(--mono);background:#ffffff2
 input[type=search]{flex:1 1 180px;max-width:360px;font:inherit;padding:7px 12px;border-radius:8px;border:1px solid var(--bd);background:#000;color:#fff}#ipq{flex:0 1 130px}
 button{font:inherit;color:#fff;background:#0a0a0a;border:1px solid var(--bd);border-radius:8px;padding:6px 12px;cursor:pointer}button:hover{border-color:var(--or)}
 button.on{background:var(--or);border-color:var(--or);color:#000;font-weight:700}
-.q{font:12px var(--mono);color:var(--mut)}.q.low{color:var(--red)}
-.tick{overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--bd);background:#050505;font-size:12.5px}
-.trk{display:inline-flex;gap:34px;padding:6px 0;animation:tk 140s linear infinite}.tick:hover .trk{animation-play-state:paused}
+.q{font:12px var(--mono);color:var(--mut)}.q.low{color:var(--red)}.grow{flex:1}
+.tick{overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--bd);background:#040404;font-size:12.5px;color:var(--mut)}
+.trk{display:inline-flex;gap:38px;padding:7px 0;animation:tk 160s linear infinite}.tick:hover .trk{animation-play-state:paused}
 .trk b{font:700 10.5px var(--mono);color:var(--or);margin-right:6px}.trk b.r{color:var(--red)}@keyframes tk{to{transform:translateX(-50%)}}
-@media(max-width:700px){header{position:static}.cards{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){.trk,.live:before,.b.new,.skel i{animation:none}}
-main{max-width:1500px;margin:0 auto;padding:16px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
-.tile{background:var(--p);border:1px solid var(--bd);border-radius:10px;padding:10px 14px;position:relative;overflow:hidden;cursor:pointer;transition:.15s}
+main{max-width:1500px;margin:0 auto;padding:24px 28px}
+.pgt{margin:0 0 6px;font-size:26px;font-weight:700;color:var(--hd)}.pgt span{font:600 13px var(--mono);color:var(--mut);margin-left:10px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}
+.tile{background:var(--p);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;cursor:pointer;transition:.15s}
 .tile:hover{border-color:var(--or);box-shadow:0 0 22px #ff7a0026}.tile:before{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:var(--or)}
-.tile b{display:block;font:800 26px var(--mono)}.tile span{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.09em}
-.spk{position:absolute;right:10px;top:12px;width:70px;height:20px}
-.hot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}.hot h3{margin:0;font:800 12px var(--mono);color:var(--or);letter-spacing:.12em}
-.hot a{cursor:pointer;font:600 12.5px var(--mono);padding:4px 10px;border-radius:999px;border:1px solid #ff7a0066;background:#ff7a0012}.hot a:hover{background:var(--or);color:#000}.hot a i{color:var(--or2)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}@media(max-width:980px){.grid{grid-template-columns:1fr}}
-.pn{background:var(--p);border:1px solid var(--bd);border-radius:12px;display:flex;flex-direction:column;min-width:0;margin-bottom:14px}.grid .pn{margin-bottom:0}
-.ph{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--bd)}
+.tile b{display:block;font:800 26px var(--mono);color:var(--hd)}.tile span{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.09em}
+.spk{position:absolute;right:12px;top:14px;width:70px;height:20px}
+.hot{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:24px}.hot h3{margin:0 6px 0 0;font:800 12px var(--mono);color:var(--or);letter-spacing:.12em}
+.hot a{cursor:pointer;font:600 12.5px var(--mono);padding:4px 10px;border-radius:999px;border:1px solid #ff7a0055;background:#ff7a0010}.hot a:hover{background:var(--or);color:#000}.hot a i{color:var(--or2)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:24px}.grid.home{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}@media(max-width:1000px){.grid,.grid.home{grid-template-columns:1fr}}
+.pn{background:var(--p);border:1px solid var(--bd);border-radius:14px;display:flex;flex-direction:column;min-width:0;margin-bottom:24px}.grid .pn{margin-bottom:0}
+.ph{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 22px;border-bottom:1px solid var(--bd)}
 .ph h2{margin:0 auto 0 0;font:800 12.5px var(--mono);letter-spacing:.16em;color:var(--or)}.tbs{display:flex;gap:6px;flex-wrap:wrap}
-.tbs button,.chips button{font-size:12.5px;padding:3px 10px;border-radius:999px}.chips{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px 0}
-.sc{max-height:76vh;overflow:auto;padding:4px 12px 10px}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:10px;padding-top:8px}
-.cards .it{border:1px solid var(--bd);border-radius:10px;background:var(--p2);padding:10px 12px}
-.it{padding:10px 0 10px 10px;border-bottom:1px solid #ffffff12}.it:last-child{border-bottom:0}
-.it.h4{box-shadow:inset 3px 0 0 var(--red)}.it.h3{box-shadow:inset 3px 0 0 var(--or)}.it.h2{box-shadow:inset 3px 0 0 var(--amb)}.it.h1{box-shadow:inset 3px 0 0 #3a3a3a}
-.tt{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-weight:600;overflow-wrap:anywhere}
-.ds{color:#d2d2d2;margin:3px 0;overflow-wrap:anywhere;font-size:13.5px}.mt{display:flex;gap:6px 10px;flex-wrap:wrap;align-items:center;color:var(--mut);font-size:12px}
+.tbs button,.chips button{font-size:12.5px;padding:3px 11px;border-radius:999px;color:var(--mut)}.tbs button.on,.chips button.on{color:#000}.chips{display:flex;gap:6px;flex-wrap:wrap;padding:14px 22px 4px}
+.sc{max-height:78vh;overflow:auto;padding:4px 22px 18px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:14px;padding-top:14px}
+.cards .it{border:1px solid var(--bd);border-radius:12px;background:var(--p2);padding:16px 18px}
+.it{padding:18px 4px 18px 14px;border-bottom:1px solid #161616}.it:last-child{border-bottom:0}
+.it.h4{box-shadow:inset 2px 0 0 var(--red)}.it.h3{box-shadow:inset 2px 0 0 var(--or)}
+.tt{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;overflow-wrap:anywhere}
+.tt a{font-size:16px;line-height:1.4;font-weight:600;color:var(--hd)}.tt a:hover{color:var(--or)}
+.ds{color:#bdbdbd;margin:6px 0 10px;overflow-wrap:anywhere;font-size:14px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cards .ds{-webkit-line-clamp:3}
+.mt{display:flex;gap:4px 12px;flex-wrap:wrap;align-items:center;color:var(--mut);font-size:12.5px}.mt .src{color:#cfcfcf;font-weight:600}
+.mt.x{margin-top:8px;opacity:0;max-height:0;overflow:hidden;transition:.15s}.it:hover .mt.x,.it:focus-within .mt.x,body.compact .mt.x{opacity:1;max-height:70px}
+@media(hover:none){.mt.x{opacity:1;max-height:70px}}
+body.compact .it{padding:10px 4px 10px 12px}body.compact .tt a{font-size:14.5px}body.compact .ds{-webkit-line-clamp:1;margin:3px 0 5px;font-size:13px}body.compact main{padding-top:16px}
 .b,.k{font:700 10.5px var(--mono);padding:1px 6px;border-radius:4px;letter-spacing:.04em;white-space:nowrap;background:#ffffff1f;color:#fff}
 .b.new{background:var(--or);color:#000;animation:gl 2.4s infinite}@keyframes gl{50%{box-shadow:0 0 12px #ff7a00cc}}
 .b.mine{background:#fff;color:#000}.b.red{background:var(--red);color:#fff}.b.arm{background:transparent;color:var(--or);border:1px solid var(--or)}.b.pr{color:var(--or2)}
 .k.itw,.k.vuln{background:#ff3d2e26;color:var(--red)}.k.public,.k.rising{background:#ff7a0026;color:var(--or)}.k.poc,.k.alert{background:#ffb02026;color:var(--amb)}.k.adv,.k.trending{background:#ffffff1f;color:#fff}.k.active{background:#ffffff12;color:var(--mut)}
 .up{color:var(--or2);font-weight:600}.cv{cursor:pointer;color:var(--or);font-family:var(--mono)}.cv:hover{text-decoration:underline}.mono{font-family:var(--mono);font-size:13px}
-.warn{margin:8px 12px 0;padding:8px 10px;border-radius:8px;background:#ff7a0014;border:1px solid #ff7a0066;color:var(--or2);font-size:12.5px}
+.warn{margin:12px 22px 0;padding:10px 12px;border-radius:8px;background:#ff7a0014;border:1px solid #ff7a0066;color:var(--or2);font-size:13px}
 .score{flex:0 0 46px;height:46px;border-radius:8px;display:grid;place-items:center;font:800 17px var(--mono);color:#fff}.rf{display:flex;gap:12px;align-items:flex-start}
-.tri{display:none;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}.tri.show,.it:hover .tri,.it:focus-within .tri,.card .tri,.cards .tri{display:flex}@media(hover:none){.tri{display:flex}}.tri select,.tri button{font:inherit;font-size:11.5px;padding:2px 6px;border-radius:6px;background:#000;color:#fff;border:1px solid var(--bd)}
+.tri{display:none;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}.tri.show,.it:hover .tri,.it:focus-within .tri,.card .tri,.cards .tri{display:flex}@media(hover:none){.tri{display:flex}}
+.tri select,.tri button{font:inherit;font-size:11.5px;padding:2px 6px;border-radius:6px;background:#000;color:#fff;border:1px solid var(--bd)}
 .tri .st-Escalated{border-color:var(--red)}.tri .st-Investigating{border-color:var(--or)}.tri .st-Mitigated{border-color:var(--grn)}
-.tn{margin-top:4px;color:#e6e6e6;font-size:12.5px;background:#ffffff0d;border-left:2px solid var(--or);padding:3px 8px;border-radius:0 6px 6px 0;overflow-wrap:anywhere}
+.tn{margin-top:6px;color:#e6e6e6;font-size:12.5px;background:#ffffff0d;border-left:2px solid var(--or);padding:4px 10px;border-radius:0 6px 6px 0;overflow-wrap:anywhere}
 .dim{opacity:.45}.pin{outline:1px solid #ff7a0055;outline-offset:-1px}
-.board{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;padding:8px 0}.col{background:var(--p2);border:1px solid var(--bd);border-radius:10px;padding:8px}
-.col h3{margin:0 0 8px;font:800 11.5px var(--mono);letter-spacing:.12em;color:var(--or)}.card{background:#000;border:1px solid var(--bd);border-radius:8px;padding:8px 10px;margin-bottom:8px}
-.ab{display:grid;grid-template-columns:1fr 1.2fr auto;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #ffffff12}
+.board{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;padding:14px 0}.col{background:var(--p2);border:1px solid var(--bd);border-radius:12px;padding:10px}
+.col h3{margin:0 0 10px;font:800 11.5px var(--mono);letter-spacing:.12em;color:var(--or)}.card{background:#000;border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:10px}
+.ab{display:grid;grid-template-columns:1fr 1.2fr auto;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid #161616}
 .bar{height:8px;background:#1a1a1a;border-radius:4px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--or),var(--or2))}
-.kw{margin-bottom:12px;color:var(--mut);font-size:13px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.empty{padding:26px;text-align:center;color:var(--mut)}.empty.sm{padding:10px;font-size:12.5px}.more{width:100%;margin:8px 0}
+.kw{margin-bottom:18px;color:var(--mut);font-size:13px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.empty{padding:30px;text-align:center;color:var(--mut)}.empty.sm{padding:10px;font-size:12.5px}.more{width:100%;margin:12px 0}
+.reader{max-width:820px;margin:0 auto}.reader .chips{padding:10px 0 18px}.reader .it{padding:26px 4px}.reader .tt a{font-size:20px;line-height:1.35}
+.reader .ds{font-size:15.5px;line-height:1.65;color:#c9c9c9;-webkit-line-clamp:3;margin:8px 0 12px}.reader .mt{font-size:13px}
+.day{padding:26px 4px 8px;font:800 12px var(--mono);letter-spacing:.16em;color:var(--or);border-bottom:1px solid var(--bd)}
+.gbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.gbar input{flex:1 1 320px;max-width:520px;font-size:16px;padding:10px 14px}.gbar button{font-size:12.5px;padding:4px 10px}
+.gleg{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.lg{font-size:12px;padding:3px 10px;border-radius:999px;display:inline-flex;gap:6px;align-items:center}.lg.off{opacity:.35}.lg b{color:var(--mut)}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.gwrap{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:20px}@media(max-width:1000px){.gwrap{grid-template-columns:1fr}}
+.gbox{position:relative;border:1px solid var(--bd);border-radius:14px;overflow:hidden;background:#000}#gc{width:100%;height:680px;display:block;cursor:grab;touch-action:none}@media(max-width:700px){#gc{height:480px}}
+.gtip{position:absolute;display:none;pointer-events:none;background:#111;border:1px solid var(--bd);padding:5px 9px;border-radius:6px;font-size:12px;max-width:260px}
+.ghint{position:absolute;left:12px;bottom:10px;color:#666;font-size:11.5px;font-family:var(--mono)}
+.gside{padding:18px;max-height:680px;overflow:auto;margin-bottom:0}.gside h3{margin:0 0 6px;font-size:16px;color:var(--hd)}.gside h4{margin:16px 0 6px;font:800 11px var(--mono);letter-spacing:.12em;color:var(--or)}
+.gi{padding:8px 0;border-bottom:1px solid #161616;font-size:13.5px}
 footer{color:var(--mut);font:12px var(--mono);line-height:1.9;margin-top:6px}footer span{display:inline-block;margin-right:14px}.g{color:var(--grn)}.r{color:var(--red)}.sk{color:var(--mut)}
 .toast{position:fixed;right:16px;bottom:16px;z-index:30;background:var(--or);color:#000;font-weight:800;padding:10px 16px;border-radius:10px;box-shadow:0 8px 30px #ff7a0066;cursor:pointer;transform:translateY(90px);opacity:0;transition:.3s}.toast.show{transform:none;opacity:1}
 .skel i{display:block;height:84px;border-radius:12px;margin-bottom:12px;background:linear-gradient(90deg,#0a0a0a 25%,#1c1c1c 50%,#0a0a0a 75%);background-size:200% 100%;animation:sk 1.2s infinite}@keyframes sk{to{background-position:-200% 0}}
@@ -795,10 +861,11 @@ footer{color:var(--mut);font:12px var(--mono);line-height:1.9;margin-top:6px}foo
 #dlg>div{width:min(760px,94vw);background:var(--p);border:1px solid var(--bd);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
 #dlg textarea{width:100%;height:50vh;background:#000;color:#fff;border:1px solid var(--bd);border-radius:8px;padding:10px;font:12.5px var(--mono)}
 .dr{display:flex;gap:8px;flex-wrap:wrap;align-items:center}a.btn{font:inherit;color:#fff;background:#0a0a0a;border:1px solid var(--bd);border-radius:8px;padding:6px 12px}a.btn:hover{border-color:var(--or);color:var(--or)}
+@media(max-width:700px){header{position:static;padding:10px 14px}main{padding:16px 14px}.cards{grid-template-columns:1fr}.sc{padding:4px 14px 14px}nav{flex-wrap:nowrap;overflow-x:auto;max-width:100%}nav button{white-space:nowrap}.tools{flex:1 1 100%;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start;padding-bottom:4px}.tools>*{flex:0 0 auto}#ipq,#ipgo,#ghq{display:none}input[type=search]{flex:0 0 170px}}
 </style></head><body>
 <header><span class="logo">◢ SECDASH</span><nav id="nav"></nav><span class="live" id="live"><span id="lt">CONNECTING</span></span>
 <div class="tools"><input type="search" id="q" placeholder="Filter everything  ( / )" aria-label="Filter"><input type="search" id="ipq" placeholder="IP lookup" aria-label="IP lookup"><button id="ipgo">Lookup</button>
-<span class="q" id="ghq"></span><button id="sort" title="Sort exploits and news">Sort: Newest</button><button id="mine">My stack</button><button id="brief">Brief</button><button id="rf">↻ Refresh</button></div></header>
+<span class="q" id="ghq"></span><button id="dens" title="Reading density">Comfortable</button><button id="sort" title="Sort exploits and news">Sort: Newest</button><button id="mine">My stack</button><button id="brief">Brief</button><button id="rf">↻ Refresh</button></div></header>
 <div class="tick"><div class="trk" id="trk"></div></div>
 <main id="main"><div class="skel"><i></i><i></i><i></i></div></main>
 <main style="padding-top:0"><footer id="foot"></footer></main>
@@ -811,12 +878,13 @@ const safe=u=>/^https?:\/\//i.test(u)?u:"#";
 const ago=t=>{const s=Math.max(0,Date.now()/1e3-t);return s<90?"just now":s<5400?Math.round(s/60)+"m ago":s<172800?Math.round(s/3600)+"h ago":Math.round(s/86400)+"d ago"};
 const fmt=n=>n>=1e3?(n/1e3).toFixed(n>=1e4?0:1)+"k":String(n);
 const b=(c,t)=>`<span class="b ${c}">${esc(t)}</span>`;
-let ST=null,V=0,Q="",MINE=false,SRC="all",MAXN=60,LAST=0,SORT="new",PAGE="home",TK="",TT;const T0=Date.now();
+let ST=null,V=0,Q="",MINE=false,SRC="all",MAXN=40,LAST=0,SORT="new",PAGE="home",TK="",TT,G=null,GT;const T0=Date.now(),HOMEN=20;
 const TAB={ex:"itw",repo:"rising",th:"ioc"};
 const TABS={ex:[["itw","In the wild"],["public","Public exploits"],["poc","GitHub PoCs"],["adv","Advisories"]],repo:[["rising","Rising"],["trending","Trending"],["active","Active"]],th:[["ioc","IOCs & C2"],["ransom","Ransomware"],["breach","Breaches"]]};
-const KL={itw:"EXPLOITED",public:"EXPLOIT",poc:"PoC",adv:"ADVISORY"},FL={KEV:"KEV",MSF:"METASPLOIT",EDB:"EXPLOIT-DB",NUC:"NUCLEI"};
-const STP=["home","exploits","threats","stack","rf"],NAMES={home:"Home",exploits:"Exploits",threats:"Threats",stack:"My Stack",rf:"Recorded Future"};
+const KL={itw:"EXPLOITED",public:"EXPLOIT",poc:"PoC",adv:"ADVISORY"},FL={KEV:"KEV",MSF:"METASPLOIT",EDB:"EXPLOIT-DB",NUC:"NUCLEI",SIG:"SIGMA"};
+const STP=["home","news","exploits","threats","stack","graph","rf"],NAMES={home:"Home",news:"News",exploits:"Exploits",threats:"Threats",stack:"My Stack",graph:"Graph",rf:"Recorded Future"};
 const EMPTY={ioc:"Feodo needs no key. ThreatFox and URLhaus need a free abuse.ch key (config.py).",ransom:"Needs a free ransomware.live key (config.py).",breach:"Waiting for Have I Been Pwned."};
+const pagesOf=()=>STP.filter(p=>p!="rf"||ST.rf_on);
 const ok=i=>(!Q||i.q.includes(Q))&&(!MINE||i.mine);
 const TR=i=>ST.triage[i.tk]||{};
 const srt=l=>[...l].sort((a,c)=>((TR(c).pinned?1:0)-(TR(a).pinned?1:0))||(SORT=="pri"?(c.p||0)-(a.p||0):0)||c.ts-a.ts);
@@ -824,50 +892,128 @@ const chips=i=>i.cves.slice(0,3).map(c=>`<a class="cv" data-q="${esc(c)}">${esc(
 const link=i=>`<a href="${esc(safe(i.url))}" target="_blank" rel="noopener noreferrer">${esc(i.title)}</a>`;
 const pr=i=>i.p?b("pr","P"+i.p):"";
 const common=i=>(i.new?b("new","NEW"):"")+(i.mine?b("mine","MY STACK"):"")+pr(i);
+const keyb=i=>(i.new?b("new","NEW"):"")+(i.mine?b("mine","MY STACK"):"")+(i.flags.includes("KEV")&&i.kind!="itw"?b("red","EXPLOITED"):"");
 const hl=p=>p>=75?4:p>=50?3:p>=30?2:1;
 const cls=i=>"it"+(i.p?" h"+hl(i.p):"")+(TR(i).pinned?" pin":"")+(["Ignored","Mitigated"].includes(TR(i).status)?" dim":"");
 const tri=i=>{const t=TR(i),s=t.status||"New";return `<div class="tri${s!="New"||t.pinned||t.note?" show":""}"><select data-tri="${esc(i.tk)}" class="st-${esc(s)}" aria-label="Triage status">${ST.statuses.map(x=>`<option${x==s?" selected":""}>${esc(x)}</option>`).join("")}</select><button data-pin="${esc(i.tk)}" title="Pin to top">${t.pinned?"📌 Pinned":"📌"}</button><button data-note="${esc(i.tk)}">✎ Note</button>${t.owner?`<span class="mt">${esc(t.owner)} · ${ago(t.ts)}</span>`:""}</div>${t.note?`<div class="tn">${esc(t.note)}</div>`:""}`};
 const w=fn=>i=>fn(i).replace('<div class="it">',`<div class="${cls(i)}">`).replace(/<\/div>$/,tri(i)+"</div>");
 const flags=i=>i.flags.map(f=>b("arm",FL[f]||f)).join("");
-const exRow=w(i=>`<div class="it"><div class="tt"><span class="k ${i.kind}">${KL[i.kind]}</span>${link(i)}</div>${i.desc?`<div class="ds">${esc(i.desc)}</div>`:""}
+const ds=i=>i.desc?`<div class="ds">${esc(i.desc)}</div>`:"";
+const xrow=i=>{const x=pr(i)+flags(i)+chips(i)+(i.actors||[]).map(a=>`<a class="cv" data-q="${esc(a)}">${esc(a)}</a>`).join(" ");return x?`<div class="mt x">${x}</div>`:""};
+const exRow=w(i=>`<div class="it"><div class="tt"><span class="k ${i.kind}">${KL[i.kind]}</span>${link(i)}</div>${ds(i)}
 <div class="mt">${common(i)}${i.m.ransom?b("red","RANSOMWARE"):""}${i.flags.filter(f=>!(i.kind=="itw"&&f=="KEV")).map(f=>b("arm",FL[f]||f)).join("")}${i.m.epss!=null?`<span>EPSS ${i.m.epss}%</span>`:""}${i.m.due?`<span>patch by ${esc(i.m.due)}</span>`:""}${i.m.verified?"<span>verified</span>":""}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span>${chips(i)}</div></div>`);
-const repoRow=w(i=>{const m=i.m;return `<div class="it"><div class="tt">${link(i)}${m.kinds.map(k=>`<span class="k ${k}">${k}</span>`).join("")}</div>${i.desc?`<div class="ds">${esc(i.desc)}</div>`:""}
-<div class="mt">${common(i)}<span>★ ${fmt(m.stars||0)}</span>${m.gained>0?`<span class="up">▲ +${fmt(m.gained)} since last run</span>`:""}${m.total_gain>0&&m.total_gain!=m.gained?`<span class="up">+${fmt(m.total_gain)} since first seen</span>`:""}${m.today?`<span class="up">+${fmt(m.today)} ${esc(m.window)}</span>`:""}${m.per_day?`<span>${m.per_day}/day</span>`:""}${m.lang?`<span>${esc(m.lang)}</span>`:""}${m.created?`<span>created ${ago(m.created)}</span>`:""}</div></div>`});
-const newsRow=w(i=>`<div class="it"><div class="tt">${link(i)}</div>${i.desc?`<div class="ds">${esc(i.desc)}</div>`:""}<div class="mt">${common(i)}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span>${flags(i)}${chips(i)}${(i.actors||[]).map(a=>`<a class="cv" data-q="${esc(a)}">${esc(a)}</a>`).join(" ")}</div></div>`);
-const depRow=w(i=>`<div class="it"><div class="tt"><span class="k itw">DEP</span>${link(i)}</div><div class="ds">${esc(i.desc)}</div><div class="mt">${common(i)}${flags(i)}<span>${ago(i.ts)}</span>${chips(i)}</div></div>`);
-const iocRow=i=>`<div class="it"><div class="tt"><span class="k itw">${esc(i.kind.toUpperCase())}</span><span class="mono">${esc(i.title)}</span></div><div class="ds">${esc(i.desc)}</div><div class="mt">${common(i)}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span>${/^\d+\.\d+\.\d+\.\d+/.test(i.title)?`<a class="cv" data-ip="${esc(i.title.split(":")[0])}">lookup</a>`:""}</div></div>`;
+const repoRow=w(i=>{const m=i.m;return `<div class="it"><div class="tt">${link(i)}${m.kinds.map(k=>`<span class="k ${k}">${k}</span>`).join("")}</div>${ds(i)}
+<div class="mt"><span class="src">★ ${fmt(m.stars||0)}</span>${m.per_day?`<span>${m.per_day}/day</span>`:""}${m.gained>0?`<span class="up">▲ +${fmt(m.gained)} since last run</span>`:""}${m.today?`<span class="up">+${fmt(m.today)} ${esc(m.window)}</span>`:""}${m.lang?`<span>${esc(m.lang)}</span>`:""}${m.created?`<span>created ${ago(m.created)}</span>`:""}${keyb(i)}</div></div>`});
+const newsRow=w(i=>`<div class="it"><div class="tt">${link(i)}</div>${ds(i)}<div class="mt"><span class="src">${esc(i.src)}</span><span>${ago(i.ts)}</span>${keyb(i)}</div>${xrow(i)}</div>`);
+const depRow=w(i=>`<div class="it"><div class="tt"><span class="k itw">DEP</span>${link(i)}</div>${ds(i)}<div class="mt">${common(i)}${flags(i)}<span>${ago(i.ts)}</span>${chips(i)}</div></div>`);
+const iocRow=i=>`<div class="it"><div class="tt"><span class="k itw">${esc(i.kind.toUpperCase())}</span><span class="mono">${esc(i.title)}</span></div>${ds(i)}<div class="mt">${common(i)}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span>${/^\d+\.\d+\.\d+\.\d+/.test(i.title)?`<a class="cv" data-ip="${esc(i.title.split(":")[0])}">lookup</a>`:""}</div></div>`;
 const ransomRow=i=>`<div class="it"><div class="tt"><span class="k itw">RANSOM</span>${esc(i.title)}</div><div class="mt">${common(i)}<span>${esc(i.desc)}</span><span>${ago(i.ts)}</span></div></div>`;
-const breachRow=i=>`<div class="it"><div class="tt">${link(i)}</div><div class="ds">${esc(i.desc)}</div><div class="mt">${common(i)}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span></div></div>`;
+const breachRow=i=>`<div class="it"><div class="tt">${link(i)}</div>${ds(i)}<div class="mt">${common(i)}<span>${esc(i.src)}</span><span>${ago(i.ts)}</span></div></div>`;
 const heat=s=>s>=85?"var(--red)":s>=65?"var(--or)":s>=40?"#a8761a":"#2a2a2a";
 const rfRow=i=>i.kind=="vuln"?`<div class="it rf"><div class="score" style="background:${heat(i.m.score)}">${i.m.score}</div><div><div class="tt">${link(i)}<span class="k vuln">${esc(i.m.label||"vuln")}</span></div>${i.m.rules.map(r=>`<div class="ds">• ${esc(r)}</div>`).join("")}<div class="mt"><span>seen ${ago(i.ts)}</span></div></div></div>`
  :`<div class="it"><div class="tt"><span class="k alert">ALERT</span>${link(i)}</div><div class="mt"><span>${esc(i.desc)}</span>${i.m.status?`<span>${esc(i.m.status)}</span>`:""}<span>${ago(i.ts)}</span></div></div>`;
 const card=i=>`<div class="card"><div class="tt">${i.url?link(i):esc(i.title)}</div><div class="mt">${i.src?`<span>${esc(i.src)}</span>`:""}${i.ts?`<span>${ago(i.ts)}</span>`:""}${i.desc&&!i.src?`<span>${esc(i.desc)}</span>`:""}</div>${tri(i)}</div>`;
+const dayLbl=t=>{const d=new Date(t*1e3),n=new Date(),s=x=>x.toDateString();return s(d)==s(n)?"Today":s(d)==s(new Date(n-864e5))?"Yesterday":d.toLocaleDateString(undefined,{weekday:"short",day:"numeric",month:"short"})};
 
 const cnt=(g,k)=>g=="ex"?ST.exploits.filter(i=>i.kind==k&&ok(i)).length:g=="repo"?ST.repos.filter(i=>i.m.kinds.includes(k)&&ok(i)).length:ST[k].filter(ok).length;
 const tabsH=g=>TABS[g].map(([k,n])=>`<button data-tab="${g}:${k}" class="${TAB[g]==k?"on":""}">${n} <i>${cnt(g,k)}</i></button>`).join("");
 const rows=(l,fn,e)=>l.length?l.map(fn).join(""):`<div class="empty">${e}</div>`;
 const panel=(id,t,tb,body,pre="")=>`<section class="pn"><div class="ph"><h2>${t}</h2><span class="tbs">${tb}</span></div>${pre}<div class="sc" id="${id}">${body}</div></section>`;
 const spark=(l,d=7)=>{const n=Array(d).fill(0),t=Date.now()/1e3;l.forEach(i=>{const k=Math.floor((t-i.ts)/86400);if(k>=0&&k<d)n[d-1-k]++});const m=Math.max(1,...n);return `<svg class="spk" viewBox="0 0 70 20" preserveAspectRatio="none"><polyline points="${n.map((v,x)=>`${x*70/(d-1)},${19-v/m*18}`).join(" ")}" fill="none" stroke="#ff7a00" stroke-width="1.6"/></svg>`};
-const tiles=()=>{const s=ST,all=[...s.news,...s.exploits,...s.repos],IC={green:"var(--grn)",yellow:"var(--amb)",orange:"var(--or)",red:"var(--red)"};
- const T=[["INFOCON",s.infocon,"home",IC[s.infocon]],["New this run",all.filter(i=>i.new).length,"home"],["Articles · 7d",s.news.filter(i=>i.ts>Date.now()/1e3-6048e2).length,"home","",spark(s.news)],
+const tiles=()=>{const s=ST,all=[...s.news,...s.exploits,...s.repos];
+ const T=[["Hot CVEs",s.hot.length,"exploits"],["New this run",all.filter(i=>i.new).length,"home"],["Articles · 7d",s.news.filter(i=>i.ts>Date.now()/1e3-6048e2).length,"news","",spark(s.news)],
   ["Exploited ITW",s.exploits.filter(i=>i.kind=="itw").length,"exploits:itw"],["Public exploits",s.exploits.filter(i=>i.kind=="public").length,"exploits:public","",spark(s.exploits.filter(i=>i.kind=="public"))],
   ["Fresh PoCs",s.exploits.filter(i=>i.kind=="poc").length,"exploits:poc"],["My stack hits",all.filter(i=>i.mine).length,"stack"],["Escalated",Object.values(s.triage).filter(t=>t.status=="Escalated").length,"stack"]];
- return `<div class="tiles">${T.map(([l,v,g,c,sp])=>`<div class="tile" data-go="${g}"><b style="${c?"color:"+c:""}">${esc(v)}</b><span>${l}</span>${sp||""}</div>`).join("")}</div>`};
-const hotH=()=>ST.hot.length?`<div class="hot"><h3>HOT CVEs</h3>${ST.hot.map(h=>`<a data-q="${esc(h.cve)}" title="${esc(h.t)}">${esc(h.cve)} <i>${h.n}</i>${h.kev?" KEV":""}${h.msf?" MSF":""}${h.nuc?" NUC":""}</a>`).join("")}</div>`:"";
+ return `<div class="tiles">${T.map(([l,v,g,c,sp])=>`<div class="tile" data-go="${g}"><b>${esc(v)}</b><span>${l}</span>${sp||""}</div>`).join("")}</div>`};
+const hotH=()=>ST.hot.length?`<div class="hot"><h3>HOT CVEs</h3>${ST.hot.map(h=>`<a data-q="${esc(h.cve)}" title="${esc(h.t)}">${esc(h.cve)} <i>${h.n}</i>${h.kev?" KEV":""}${h.msf?" MSF":""}${h.nuc?" NUC":""}${h.sig?" SIG":""}</a>`).join("")}</div>`:"";
+
+/* ───────── knowledge graph (inspired by graphify: clusters, most-connected nodes, extracted vs inferred links) ───────── */
+const GCOL={cve:"#ff7a00",hub:"#ffffff",itw:"#ff3d2e",public:"#ffb020",poc:"#ffe08a",adv:"#cfcfcf",news:"#7d7d7d",repo:"#f5f5f5",actor:"#ff9a3c",dep:"#ff6a4d"};
+const GLAB={hub:"Search",cve:"CVE",itw:"Exploited (KEV)",public:"Public exploit",poc:"PoC",adv:"Advisory",news:"News",repo:"GitHub repo",actor:"Threat actor",dep:"My dependency"};
+const TL={itw:"EXPLOITED",public:"EXPLOIT",poc:"PoC",adv:"ADVISORY",repo:"REPO",dep:"DEP"};
+function gBuild(){
+  const q=Q,rx=q?new RegExp((q.length<=4?"\\b":"")+q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"i"):null;
+  const pool=[...ST.exploits,...ST.news,...ST.deps,...ST.repos].filter(i=>!MINE||i.mine),hc=new Set(ST.hot.map(h=>h.cve));
+  const seeds=pool.filter(i=>rx?rx.test(i.q):i.cves.some(c=>hc.has(c))).sort((a,c)=>(c.p||0)-(a.p||0)||c.ts-a.ts).slice(0,70);
+  const seedSet=new Set(seeds),cv=new Set(seeds.flatMap(i=>i.cves));
+  const items=[...seeds,...pool.filter(i=>!seedSet.has(i)&&i.cves.some(c=>cv.has(c))).slice(0,60)];   // pull in everything that shares a CVE
+  const N=new Map(),E=[];
+  const node=(id,type,label,o)=>{if(!N.has(id))N.set(id,{id,type,label,x:(Math.random()-.5)*320,y:(Math.random()-.5)*320,vx:0,vy:0,deg:0,nb:[],...o});return N.get(id)};
+  const edge=(a,b,kind)=>{E.push({a,b,kind,len:kind=="inf"?140:90});a.deg++;b.deg++;a.nb.push(b);b.nb.push(a)};
+  const hub=q&&seeds.length?node("hub","hub",q.toUpperCase(),{}):null;
+  for(const i of items){const ty=i.sec=="news"?"news":i.sec=="exploit"?i.kind:i.sec=="dep"?"dep":"repo",n=node("i:"+i.id,ty,i.title,{item:i});
+    for(const c of i.cves.slice(0,4))edge(n,node("c:"+c,"cve",c,{items:[]}),"ext");        // EXTRACTED: the CVE is literally in the text
+    for(const a of i.actors||[])edge(n,node("a:"+a,"actor",a,{}),"ext");
+    if(hub&&seedSet.has(i)&&!i.cves.length&&!(i.actors||[]).length)edge(hub,n,"inf")}      // INFERRED: matched your search words only
+  if(hub)for(const c of new Set(seeds.flatMap(i=>i.cves.slice(0,4))))edge(hub,N.get("c:"+c),"inf");
+  for(const e of E)if(e.b.type=="cve"&&e.a.item)e.b.items.push(e.a.item);
+  const nodes=[...N.values()];
+  for(const n of nodes){if(n.type=="cve"){n.flags=[...new Set(n.items.flatMap(i=>i.flags))];const ep=n.items.map(i=>i.m.epss).filter(v=>v!=null);n.epss=ep.length?Math.max(...ep):null}
+    n.r=n.type=="hub"?18:n.type=="cve"?10+Math.min(14,n.deg*1.3):n.type=="actor"?10+Math.min(8,n.deg):6+Math.min(4,((n.item&&n.item.p)||0)/25)}
+  const seen=new Set();let comps=0;for(const n of nodes){if(n.type=="hub"||seen.has(n.id))continue;comps++;const st=[n];seen.add(n.id);while(st.length){const x=st.pop();for(const y of x.nb)if(y.type!="hub"&&!seen.has(y.id)){seen.add(y.id);st.push(y)}}}
+  G={nodes,edges:E,comps,hidden:new Set(),tx:null,ty:null,k:1,sel:null,hov:null,t:0,dirty:1,v:V,q}}
+function tick(){const N=G.nodes;for(const a of N){a.fx=0;a.fy=0}
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){const a=N[i],c=N[j];let dx=a.x-c.x,dy=a.y-c.y;const d2=dx*dx+dy*dy+.5,d=Math.sqrt(d2),f=2800/d2;dx/=d;dy/=d;a.fx+=dx*f;a.fy+=dy*f;c.fx-=dx*f;c.fy-=dy*f}
+  for(const e of G.edges){let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y;const d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-e.len)*.03;dx/=d;dy/=d;e.a.fx+=dx*f;e.a.fy+=dy*f;e.b.fx-=dx*f;e.b.fy-=dy*f}
+  const cool=Math.max(.2,1-G.t/520);for(const a of N){if(a.drag)continue;a.fx-=a.x*.006;a.fy-=a.y*.006;a.vx=Math.max(-30,Math.min(30,(a.vx+a.fx)*.78));a.vy=Math.max(-30,Math.min(30,(a.vy+a.fy)*.78));a.x+=a.vx*cool;a.y+=a.vy*cool}}
+function draw(x){const{W,H}=G,dpr=window.devicePixelRatio||1;x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,W,H);
+  const act=G.sel||G.hov,nb=act?new Set([act.id,...act.nb.map(n=>n.id)]):null,P=n=>[n.x*G.k+G.tx,n.y*G.k+G.ty];
+  x.lineWidth=1;for(const e of G.edges){if(G.hidden.has(e.a.type)||G.hidden.has(e.b.type))continue;const on=nb&&(e.a===act||e.b===act);x.globalAlpha=nb?(on?.95:.06):.4;x.strokeStyle=on?"#ff7a00":"#888";x.setLineDash(e.kind=="inf"?[4,4]:[]);x.beginPath();x.moveTo(...P(e.a));x.lineTo(...P(e.b));x.stroke()}
+  x.setLineDash([]);
+  for(const n of G.nodes){if(G.hidden.has(n.type))continue;const[sx,sy]=P(n),on=!nb||nb.has(n.id);x.globalAlpha=on?1:.12;x.fillStyle=GCOL[n.type];x.beginPath();x.arc(sx,sy,n.r*G.k,0,6.283);x.fill();if(n===G.sel){x.strokeStyle="#fff";x.lineWidth=2;x.stroke()}
+    if(on&&(n.type=="cve"||n.type=="hub"||n.type=="actor"||n===act||G.k>1.8)){x.fillStyle="#fff";x.font=(n.type=="cve"?"600 ":"")+"11px ui-monospace,Menlo,monospace";x.fillText(n.label.slice(0,n.type=="cve"?18:34),sx+n.r*G.k+4,sy+4)}}
+  x.globalAlpha=1}
+const gitem=i=>`<div class="gi"><span class="k ${i.sec=="news"?"adv":i.kind}">${i.sec=="news"?"NEWS":TL[i.kind]||"REPO"}</span> <a href="${esc(safe(i.url))}" target="_blank" rel="noopener noreferrer">${esc(i.title)}</a><div class="mt">${esc(i.src)} · ${ago(i.ts)}</div></div>`;
+function report(){if(!G.nodes.length)return `<h3>No matches</h3><div class="ds">Nothing in the live feeds matches "${esc(G.q)}". Try a technology, vendor or CVE.</div>`;
+  const li=n=>`<div class="gi"><a class="cv" data-gsel="${esc(n.id)}">${esc(n.label.slice(0,44))}</a> <span class="mt">${n.deg} links</span></div>`;
+  const gods=G.nodes.filter(n=>n.type!="hub").sort((a,c)=>c.deg-a.deg).slice(0,6),weap=G.nodes.filter(n=>n.type=="cve"&&n.items.some(i=>i.sec=="news")&&n.items.some(i=>i.sec!="news")).sort((a,c)=>c.deg-a.deg).slice(0,6);
+  return `<h3>Graph report</h3><div class="mt">${G.nodes.length} nodes · ${G.edges.length} links · ${G.comps} clusters</div><h4>Most connected</h4>${gods.map(li).join("")}<h4>In the news AND exploitable</h4>${weap.map(li).join("")||'<div class="mt">None in this view.</div>'}`}
+function renderSel(){const n=G&&G.sel,el=$("#gs");if(!el)return;if(!n){el.innerHTML=report();return}
+  let h=`<button class="more" data-gsel="" style="margin-top:0">← Graph report</button>`;
+  if(n.type=="cve")h+=`<h3>${esc(n.label)}</h3><div class="mt">${(n.flags||[]).map(f=>b("arm",FL[f]||f)).join(" ")}${n.epss!=null?`<span>EPSS ${n.epss}%</span>`:""}<a class="cv" href="https://nvd.nist.gov/vuln/detail/${esc(n.label)}" target="_blank" rel="noopener noreferrer">NVD ↗</a></div><h4>${n.items.length} linked items</h4>`+n.items.map(gitem).join("");
+  else if(n.type=="actor"){const a=ST.actors.find(x=>x.name==n.label);h+=`<h3>${esc(n.label)}</h3><div class="mt"><a class="cv" href="${esc(safe(a?a.url:""))}" target="_blank" rel="noopener noreferrer">MITRE ATT&amp;CK ↗</a></div><h4>Mentioned in</h4>`+n.nb.filter(x=>x.item).map(x=>gitem(x.item)).join("")}
+  else if(n.type=="hub")h+=`<h3>${esc(n.label)}</h3><div class="ds">Your search. Dashed links are inferred from text matching; solid links are extracted (the CVE or actor is named in the item).</div>`;
+  else{const i=n.item;h+=gitem(i)+`<div class="ds">${esc(i.desc)}</div>`+(i.cves.length?`<h4>CVEs</h4>`+i.cves.map(c=>`<a class="cv" data-gsel="c:${esc(c)}">${esc(c)}</a>`).join(" "):"")}
+  el.innerHTML=h}
+function legend(){const c={};G.nodes.forEach(n=>c[n.type]=(c[n.type]||0)+1);$("#gl").innerHTML=Object.keys(GLAB).filter(t=>c[t]).map(t=>`<button class="lg ${G.hidden.has(t)?"off":""}" data-gt="${t}"><span class="dot" style="background:${GCOL[t]}"></span>${GLAB[t]} <b>${c[t]}</b></button>`).join("")+`<span class="mt">dashed = inferred from your search</span>`}
+function fit(){if(!G||!G.nodes.length||G.touched)return;let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;for(const n of G.nodes){x0=Math.min(x0,n.x-n.r);x1=Math.max(x1,n.x+n.r);y0=Math.min(y0,n.y-n.r);y1=Math.max(y1,n.y+n.r)}
+  const k=Math.max(.4,Math.min(2.4,Math.min((G.W-140)/Math.max(80,x1-x0),(G.H-120)/Math.max(80,y1-y0))));G.k=k;G.tx=G.W/2-(x0+x1)/2*k;G.ty=G.H/2-(y0+y1)/2*k;G.dirty=1}
+function gStart(){const c=$("#gc");if(!c||!G)return;cancelAnimationFrame(G.raf);const dpr=window.devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.round(r.width*dpr);c.height=Math.round(r.height*dpr);G.W=r.width;G.H=r.height;if(G.tx==null){G.tx=G.W/2;G.ty=G.H/2}
+  const x=c.getContext("2d"),pos=e=>{const bb=c.getBoundingClientRect();return[e.clientX-bb.left,e.clientY-bb.top]};
+  const pick=(px,py)=>{let best=null,bd=1e9;for(const n of G.nodes){if(G.hidden.has(n.type))continue;const d=Math.hypot(px-(n.x*G.k+G.tx),py-(n.y*G.k+G.ty));if(d<=n.r*G.k+4&&d<bd){best=n;bd=d}}return best};
+  let drag=null,pan=null,moved=false;
+  c.onpointerdown=e=>{G.touched=true;c.setPointerCapture(e.pointerId);const[px,py]=pos(e),n=pick(px,py);moved=false;if(n){drag=n;n.drag=true}else pan=[px-G.tx,py-G.ty]};
+  c.onpointermove=e=>{const[px,py]=pos(e);if(drag){moved=true;drag.x=(px-G.tx)/G.k;drag.y=(py-G.ty)/G.k;drag.vx=drag.vy=0;G.t=Math.min(G.t,400)}else if(pan){moved=true;G.tx=px-pan[0];G.ty=py-pan[1]}
+    else{const n=pick(px,py),t=$("#gt");if(n!==G.hov){G.hov=n;c.style.cursor=n?"pointer":"grab"}if(n){t.textContent=n.label+" · "+GLAB[n.type];t.style.cssText=`display:block;left:${Math.min(px+14,G.W-270)}px;top:${py+14}px`}else t.style.display="none"}G.dirty=1};
+  c.onpointerup=()=>{if(drag){drag.drag=false;if(!moved){G.sel=drag;renderSel()}}else if(pan&&!moved){G.sel=null;renderSel()}drag=pan=null;G.dirty=1};
+  c.onpointerleave=()=>{$("#gt").style.display="none";G.hov=null;G.dirty=1};
+  c.onwheel=e=>{G.touched=true;e.preventDefault();const[px,py]=pos(e),k=Math.min(4,Math.max(.3,G.k*(e.deltaY<0?1.12:1/1.12)));G.tx=px-(px-G.tx)*k/G.k;G.ty=py-(py-G.ty)*k/G.k;G.k=k;G.dirty=1};
+  legend();renderSel();for(let i=0;i<150;i++)tick();fit();
+  const loop=()=>{if(!document.body.contains(c))return;if(G.t<520){tick();tick();G.t++;G.dirty=1;if(G.t==260||G.t==519)fit()}if(G.dirty){draw(x);G.dirty=0}G.raf=requestAnimationFrame(loop)};loop()}
+const gStop=()=>{if(G)cancelAnimationFrame(G.raf)};
+const gRe=()=>{gBuild();gStart()};
+function dl(name,mime,text){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type:mime}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
+function gExport(kind){const X=s=>String(s).replace(/[<>&"']/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;","'":"&apos;"}[c])),conf=e=>e.kind=="inf"?"INFERRED":"EXTRACTED";
+  if(kind=="json")dl("secdash-graph.json","application/json",JSON.stringify({query:Q,nodes:G.nodes.map(n=>({id:n.id,type:n.type,label:n.label,url:n.item?n.item.url:"",links:n.deg})),edges:G.edges.map(e=>({source:e.a.id,target:e.b.id,confidence:conf(e)}))},null,1));
+  else dl("secdash-graph.graphml","application/xml",'<?xml version="1.0" encoding="UTF-8"?>\n<graphml xmlns="http://graphml.graphdrawing.org/xmlns"><key id="t" for="node" attr.name="type" attr.type="string"/><key id="l" for="node" attr.name="label" attr.type="string"/><key id="c" for="edge" attr.name="confidence" attr.type="string"/><graph edgedefault="undirected">'+G.nodes.map(n=>`<node id="${X(n.id)}"><data key="t">${n.type}</data><data key="l">${X(n.label)}</data></node>`).join("")+G.edges.map((e,i)=>`<edge id="e${i}" source="${X(e.a.id)}" target="${X(e.b.id)}"><data key="c">${conf(e)}</data></edge>`).join("")+"</graph></graphml>")}
 
 const PG={
- home(){const s=ST,cn={};s.news.forEach(i=>cn[i.src]=(cn[i.src]||0)+1);
-  const nr=srt(s.news.filter(i=>ok(i)&&(SRC=="all"||i.src==SRC)));
-  const ch=`<div class="chips">${[["all","All"],...Object.entries(cn).sort((a,c)=>c[1]-a[1]).slice(0,10).map(([k,v])=>[k,k+" "+v])].map(([k,n])=>`<button data-src="${esc(k)}" class="${SRC==k?"on":""}">${esc(n)}</button>`).join("")}</div>`;
-  const nb=rows(nr.slice(0,MAXN),newsRow,"No matching articles yet.")+(nr.length>MAXN?`<button class="more" data-more="1">Show more (${nr.length-MAXN})</button>`:"");
-  const rk={rising:i=>i.m.per_day||0,trending:i=>i.m.today||0,active:i=>(i.m.gained||0)*1e6+(i.m.stars||0)}[TAB.repo];
+ home(){const s=ST,rk={rising:i=>i.m.per_day||0,trending:i=>i.m.today||0,active:i=>(i.m.gained||0)*1e6+(i.m.stars||0)}[TAB.repo];
+  const nr=srt(s.news.filter(i=>ok(i)&&(SRC=="all"||i.src==SRC))),cn={};s.news.forEach(i=>cn[i.src]=(cn[i.src]||0)+1);
+  const ch=`<div class="chips">${[["all","All"],...Object.entries(cn).sort((a,c)=>c[1]-a[1]).slice(0,6).map(([k,v])=>[k,k])].map(([k,n])=>`<button data-src="${esc(k)}" class="${SRC==k?"on":""}">${esc(n)}</button>`).join("")}</div>`;
+  const nb=rows(nr.slice(0,HOMEN),newsRow,"No matching articles yet.")+`<button class="more" data-page="news">Open the news reader (${nr.length} articles) →</button>`;
   const rb=rows(s.repos.filter(i=>i.m.kinds.includes(TAB.repo)&&ok(i)).sort((a,c)=>rk(c)-rk(a)),repoRow,"Nothing yet for this view.");
-  return tiles()+hotH()+`<div class="grid">${panel("l-news","LATEST NEWS","",nb,ch)}${panel("l-repo","GITHUB · SECURITY REPOS",tabsH("repo"),rb)}</div>`},
+  return tiles()+hotH()+`<div class="grid home">${panel("l-news","LATEST NEWS","",nb,ch)}${panel("l-repo","GITHUB · SECURITY REPOS",tabsH("repo"),rb)}</div>`},
+ news(){const s=ST,cn={};s.news.forEach(i=>cn[i.src]=(cn[i.src]||0)+1);
+  const nr=s.news.filter(i=>ok(i)&&(SRC=="all"||i.src==SRC)).sort((a,c)=>c.ts-a.ts);
+  const ch=`<div class="chips">${[["all","All"],...Object.entries(cn).sort((a,c)=>c[1]-a[1]).slice(0,12).map(([k,v])=>[k,k+" "+v])].map(([k,n])=>`<button data-src="${esc(k)}" class="${SRC==k?"on":""}">${esc(n)}</button>`).join("")}</div>`;
+  let last="",out="";nr.slice(0,MAXN).forEach(i=>{const d=dayLbl(i.ts);if(d!=last){last=d;out+=`<div class="day">${esc(d)}</div>`}out+=newsRow(i)});
+  return `<div class="reader"><h1 class="pgt">Latest news<span>${nr.length} articles</span></h1>${ch}${out||'<div class="empty">No matching articles yet.</div>'}${nr.length>MAXN?`<button class="more" data-more="1">Show more (${nr.length-MAXN})</button>`:""}</div>`},
  exploits(){const l=srt(ST.exploits.filter(i=>i.kind==TAB.ex&&ok(i)));
   const warn=TAB.ex=="poc"?`<div class="warn">⚠ Unvetted code. Fake PoCs on GitHub often carry malware. Read first, run only in an isolated lab.</div>`:"";
   return hotH()+panel("l-ex","EXPLOITS & ADVISORIES",tabsH("ex"),`<div class="cards">${rows(l,exRow,"Nothing yet for this view.")}</div>`,warn)},
  threats(){const mx=Math.max(1,...ST.actors.map(a=>a.n));
-  const act=ST.actors.length?ST.actors.map(a=>`<div class="ab"><a href="${esc(safe(a.url))}" target="_blank" rel="noopener noreferrer">${esc(a.name)}</a><span class="bar"><i style="width:${a.n/mx*100}%"></i></span><a class="cv" data-q="${esc(a.name)}" data-go="home">${a.n} articles</a></div>`).join(""):'<div class="empty">No named threat groups in the current news.</div>';
+  const act=ST.actors.length?ST.actors.map(a=>`<div class="ab"><a href="${esc(safe(a.url))}" target="_blank" rel="noopener noreferrer">${esc(a.name)}</a><span class="bar"><i style="width:${a.n/mx*100}%"></i></span><a class="cv" data-q="${esc(a.name)}" data-go="news">${a.n} articles</a></div>`).join(""):'<div class="empty">No named threat groups in the current news.</div>';
   const fn={ioc:iocRow,ransom:ransomRow,breach:breachRow}[TAB.th];
   return `<div class="grid">${panel("l-act","THREAT ACTORS IN THE NEWS · MITRE ATT&CK","",act)}${panel("l-th","ACTIVE THREATS",tabsH("th"),rows(ST[TAB.th].filter(ok),fn,EMPTY[TAB.th]))}</div>`},
  stack(){const s=ST,idx={};[...s.exploits,...s.news,...s.deps,...s.repos].forEach(i=>{if(!idx[i.tk])idx[i.tk]=i});
@@ -876,20 +1022,24 @@ const PG={
   const mine=srt([...s.exploits,...s.news].filter(i=>i.mine&&ok(i))),od=s.status["My dependencies (OSV)"];
   return `<div class="kw">Watching: ${s.keywords.map(k=>b("",k)).join(" ")}</div>`+panel("l-board","TEAM TRIAGE BOARD","",`<div class="board">${["Escalated","Investigating","Mitigated","Pinned"].map(col).join("")}</div>`)+
    `<div class="grid">${panel("l-mine","MATCHES FOR YOUR STACK","",rows(mine.slice(0,80),i=>i.sec=="news"?newsRow(i):exRow(i),"Nothing in the current feeds matches your keywords."))}${panel("l-dep","MY DEPENDENCIES (OSV)","",rows(s.deps.filter(ok),depRow,od&&od.ok==2?"Add your packages to PACKAGES in config.py.":"No known vulnerabilities in your listed packages."))}</div>`},
- rf(){const f=(l)=>rows(l.filter(ok),rfRow,"No data (see source status below).");return `<div class="grid">${panel("rv","RECORDED FUTURE · VULNERABILITIES","",f(ST.rf.vulns))}${panel("ra","RECORDED FUTURE · ALERTS","",f(ST.rf.alerts))}</div>`}
+ graph(){const sug=[...new Set(["php","wordpress","exchange","fortinet","log4j",...ST.keywords.slice(0,5)])];
+  return `<h1 class="pgt">Knowledge graph<span>news · exploits · PoCs · actors, linked by CVE</span></h1><div class="gbar"><input type="search" id="gq" value="${esc(Q)}" placeholder="Graph a technology, vendor or CVE: PHP, Exchange, Fortinet…" aria-label="Graph search">${sug.map(k=>`<button data-gq="${esc(k)}">${esc(k)}</button>`).join("")}<span class="grow"></span><button data-gx="rebuild">↻ Rebuild</button><button data-gx="graphml">GraphML</button><button data-gx="json">JSON</button></div>
+  <div class="gleg" id="gl"></div><div class="gwrap"><div class="gbox"><canvas id="gc"></canvas><div class="gtip" id="gt"></div><div class="ghint">drag nodes · scroll to zoom · click to inspect</div></div><aside class="pn gside" id="gs"></aside></div>`},
+ rf(){const f=l=>rows(l.filter(ok),rfRow,"No data (see source status below).");return `<div class="grid">${panel("rv","RECORDED FUTURE · VULNERABILITIES","",f(ST.rf.vulns))}${panel("ra","RECORDED FUTURE · ALERTS","",f(ST.rf.alerts))}</div>`}
 };
 
 function ticker(){const it=[...ST.exploits.filter(i=>i.kind=="itw").slice(0,6).map(i=>["EXPLOITED",i]),...[...ST.news].sort((a,c)=>(c.p||0)-(a.p||0)||c.ts-a.ts).slice(0,10).map(i=>["NEWS",i])];
  const h=it.map(([k,i])=>`<a href="${esc(safe(i.url))}" target="_blank" rel="noopener noreferrer"><b class="${k=="EXPLOITED"?"r":""}">${k}</b>${esc(i.title)}</a>`).join("");
  if(h!==TK){TK=h;$("#trk").innerHTML=h+h}}
 function render(){
-  if(!ST)return;const s=ST,pages=STP.filter(p=>p!="rf"||s.rf_on);if(!pages.includes(PAGE))PAGE="home";
+  if(!ST)return;const s=ST,pages=pagesOf();if(!pages.includes(PAGE))PAGE="home";
   const nw=[...s.news,...s.exploits,...s.repos].filter(i=>i.new).length;document.title=(nw?`(${nw}) `:"")+"Secdash";
-  const bd={exploits:s.exploits.filter(i=>i.kind=="itw"&&i.new).length,threats:s.ioc.filter(i=>i.new).length+s.ransom.filter(i=>i.new).length,stack:[...s.exploits,...s.news].filter(i=>i.mine).length};
+  const bd={news:s.news.filter(i=>i.new).length,exploits:s.exploits.filter(i=>i.kind=="itw"&&i.new).length,threats:s.ioc.filter(i=>i.new).length+s.ransom.filter(i=>i.new).length,stack:[...s.exploits,...s.news].filter(i=>i.mine).length};
   $("#nav").innerHTML=pages.map((p,n)=>`<button data-page="${p}" class="${PAGE==p?"on":""}" title="Key ${n+1}">${NAMES[p]}${bd[p]?` <i>${bd[p]}</i>`:""}</button>`).join("");
   const g=s.gh,gq=$("#ghq");gq.textContent=g&&g.limit?`GitHub API ${g.remaining}/${g.limit}`:"";gq.className="q"+(g&&g.limit&&g.remaining<=2?" low":"");
-  ticker();const sc={};document.querySelectorAll(".sc").forEach(e=>sc[e.id]=e.scrollTop);
-  $("#main").innerHTML=PG[PAGE]();document.querySelectorAll(".sc").forEach(e=>{if(sc[e.id])e.scrollTop=sc[e.id]});
+  ticker();const m=$("#main");
+  if(PAGE=="graph"){if(!$("#gc")){m.innerHTML=PG.graph();gRe()}}   // the graph keeps its layout across live updates; press Rebuild to refresh its data
+  else{gStop();const sc={};document.querySelectorAll(".sc").forEach(e=>sc[e.id]=e.scrollTop);m.innerHTML=PG[PAGE]();document.querySelectorAll(".sc").forEach(e=>{if(sc[e.id])e.scrollTop=sc[e.id]})}
   $("#foot").innerHTML=Object.entries(s.status).map(([k,v])=>`<span class="${["r","g","sk"][v.ok]}" title="${esc(v.msg)}">${["✕","●","○"][v.ok]} ${esc(k)}: ${esc(v.msg)}</span>`).join("")+`<br><span class="sk">Keys: 1-${pages.length} pages · / filter · Esc close</span>`;
 }
 function prep(){for(const l of [ST.news,ST.exploits,ST.repos,ST.rf.vulns,ST.rf.alerts,ST.ioc,ST.ransom,ST.breach,ST.deps])for(const i of l)i.q=(i.title+" "+i.desc+" "+i.cves.join(" ")+" "+i.src+" "+(i.actors||[]).join(" ")).toLowerCase()}
@@ -898,29 +1048,38 @@ const go=p=>{if(location.hash=="#"+p){fromHash();render()}else location.hash=p};
 function toast(m,p){const t=$("#toast");t.textContent=m;t.onclick=()=>{go(p);t.classList.remove("show")};t.classList.add("show");clearTimeout(TT);TT=setTimeout(()=>t.classList.remove("show"),7000)}
 async function pull(){try{const r=await fetch("/api/state?v="+V,{cache:"no-store"});if(r.status==401){location.reload();return}
   const j=await r.json();LAST=Date.now();if(!j.same){const old=ST&&new Set([...ST.news,...ST.exploits].map(i=>i.id));ST=j;V=j.v;prep();render();
-   if(old&&Date.now()-T0>9e4){const nn=ST.news.filter(i=>!old.has(i.id)).length,ne=ST.exploits.filter(i=>!old.has(i.id)).length;if(nn+ne)toast("+ "+[ne&&ne+" exploit"+(ne>1?"s":""),nn&&nn+" article"+(nn>1?"s":"")].filter(Boolean).join(" · "),ne?"exploits":"home")}}}catch(e){}live()}
+   if(old&&Date.now()-T0>9e4){const nn=ST.news.filter(i=>!old.has(i.id)).length,ne=ST.exploits.filter(i=>!old.has(i.id)).length;if(nn+ne)toast("+ "+[ne&&ne+" exploit"+(ne>1?"s":""),nn&&nn+" article"+(nn>1?"s":"")].filter(Boolean).join(" · "),ne?"exploits":"news")}}}catch(e){}live()}
 function live(){const e=$("#live"),off=Date.now()-LAST>6e4;e.className="live"+(off?" off":"");$("#lt").textContent=off?"OFFLINE":"LIVE · "+(ST?"updated "+ago(ST.now):"loading")}
 const who=()=>{let n="";try{n=localStorage.getItem("sd_name")||""}catch(e){}if(!n){n=(prompt("Your name (shown next to your triage actions):","")||"").trim().slice(0,40);try{localStorage.setItem("sd_name",n)}catch(e){}}return n};
 async function tpost(o){o.owner=who();await fetch("/api/triage",{method:"POST",headers:{"X-Requested-With":"secdash","Content-Type":"application/json"},body:JSON.stringify(o)});V=0;pull()}
+const setQ=v=>{Q=v.trim().toLowerCase();$("#q").value=v;const g=$("#gq");if(g)g.value=v};
 document.addEventListener("change",e=>{const k=e.target.dataset&&e.target.dataset.tri;if(k)tpost({key:k,status:e.target.value})});
-document.addEventListener("click",e=>{const t=e.target.closest("[data-tab],[data-q],[data-src],[data-more],[data-pin],[data-note],[data-ip],[data-page],[data-go]");if(!t||!ST)return;const d=t.dataset;
+document.addEventListener("input",e=>{if(e.target.id=="gq"){clearTimeout(GT);GT=setTimeout(()=>{setQ(e.target.value);gRe()},300)}});
+document.addEventListener("click",e=>{const t=e.target.closest("[data-tab],[data-q],[data-src],[data-more],[data-pin],[data-note],[data-ip],[data-page],[data-go],[data-gq],[data-gt],[data-gsel],[data-gx]");if(!t||!ST)return;const d=t.dataset;
   if(d.ip){lookup(d.ip);return}
   if(d.pin){tpost({key:d.pin,pinned:!(ST.triage[d.pin]||{}).pinned});return}
   if(d.note){const n=prompt("Team note (visible to everyone):",(ST.triage[d.note]||{}).note||"");if(n!==null)tpost({key:d.note,note:n});return}
+  if(d.gq!==undefined){setQ(d.gq);gRe();return}
+  if(d.gt){G.hidden.has(d.gt)?G.hidden.delete(d.gt):G.hidden.add(d.gt);legend();G.dirty=1;return}
+  if(d.gsel!==undefined){G.sel=d.gsel?G.nodes.find(n=>n.id==d.gsel)||null:null;renderSel();G.dirty=1;return}
+  if(d.gx){d.gx=="rebuild"?gRe():gExport(d.gx);return}
   if(d.page){go(d.page);return}
   if(d.tab){const[g,k]=d.tab.split(":");TAB[g]=k}
-  if(d.q){Q=d.q.toLowerCase();$("#q").value=d.q}
-  if(d.src){SRC=d.src;MAXN=60}
-  if(d.more)MAXN+=100;
+  if(d.q){setQ(d.q);if(PAGE=="graph"){gRe();return}}
+  if(d.src){SRC=d.src;MAXN=40}
+  if(d.more)MAXN+=60;
   if(d.go){const[p,k]=d.go.split(":");if(k)TAB.ex=k;go(p);return}
   render()});
 document.addEventListener("keydown",e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)){if(e.key=="Escape")e.target.blur();return}
   if(e.key=="/"){e.preventDefault();$("#q").focus()}else if(e.key=="Escape")$("#dlg").classList.remove("open");
-  else if(/^[1-5]$/.test(e.key)&&ST){const p=STP.filter(p=>p!="rf"||ST.rf_on)[+e.key-1];if(p)go(p)}});
+  else if(/^[1-7]$/.test(e.key)&&ST){const p=pagesOf()[+e.key-1];if(p)go(p)}});
 window.addEventListener("hashchange",()=>{fromHash();render();window.scrollTo(0,0)});
-$("#q").oninput=e=>{Q=e.target.value.trim().toLowerCase();MAXN=60;render()};
-$("#mine").onclick=e=>{MINE=!MINE;e.target.classList.toggle("on",MINE);render()};
+$("#q").oninput=e=>{MAXN=40;if(PAGE=="graph"){clearTimeout(GT);GT=setTimeout(()=>{setQ(e.target.value);gRe()},300)}else{Q=e.target.value.trim().toLowerCase();render()}};
+$("#mine").onclick=e=>{MINE=!MINE;e.target.classList.toggle("on",MINE);PAGE=="graph"?gRe():render()};
 $("#sort").onclick=e=>{SORT=SORT=="new"?"pri":"new";e.target.textContent="Sort: "+(SORT=="new"?"Newest":"Priority");render()};
+const dens=()=>{$("#dens").textContent=document.body.classList.contains("compact")?"Compact":"Comfortable"};
+try{if(localStorage.getItem("sd_compact")=="1")document.body.classList.add("compact")}catch(e){}dens();
+$("#dens").onclick=()=>{const c=document.body.classList.toggle("compact");try{localStorage.setItem("sd_compact",c?"1":"0")}catch(e){}dens()};
 $("#rf").onclick=async()=>{await fetch("/api/refresh",{method:"POST",headers:{"X-Requested-With":"secdash"}});let n=0;const t=setInterval(()=>{pull();if(++n>20)clearInterval(t)},3000)};
 async function lookup(ip){$("#dt").textContent="IP lookup · "+ip;$("#dx").style.display="none";$("#bt").value="Looking up…";$("#dlg").classList.add("open");
   try{$("#bt").value=JSON.stringify(await(await fetch("/api/lookup?ip="+encodeURIComponent(ip))).json(),null,2)}catch(e){$("#bt").value="Lookup failed."}}
