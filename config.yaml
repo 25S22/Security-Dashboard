@@ -1,0 +1,35 @@
+server:
+  host: 0.0.0.0        # 0.0.0.0 = LAN, 127.0.0.1 = this machine only
+  port: 8080
+  token: ""            # empty + LAN host => random access token generated into .token
+refresh_minutes: 60
+watchlist: [apache, nginx, fortinet, cisco, openssl, log4j, microsoft, vmware]   # edit to your stack
+
+# Optional keys, read from environment variables (all free):
+keys:
+  github: GITHUB_TOKEN              # raises GitHub rate limits
+  nvd: NVD_API_KEY                  # raises NVD rate limits
+  abusech: ABUSECH_AUTH_KEY         # abuse.ch account -> ThreatFox + URLhaus
+  ransomware_live: RANSOMWARE_LIVE_API_KEY   # ransomware.live PRO key (free)
+  greynoise: GREYNOISE_API_KEY      # optional, IP lookup
+
+nvd_days: 7
+tool_days: 30
+tool_topics: [security, dfir, red-team, threat-hunting, cve, siem, malware-analysis]
+
+# Your own software, checked against OSV.dev (no key). Ecosystems: PyPI, npm, Go, Maven, crates.io, RubyGems ...
+packages: []
+#  - {ecosystem: PyPI, name: django, version: "4.2.0"}
+#  - {ecosystem: npm, name: express, version: "4.17.1"}
+
+feeds:
+  - {name: The Hacker News, url: "https://feeds.feedburner.com/TheHackersNews"}
+  - {name: Krebs on Security, url: "https://krebsonsecurity.com/feed/"}
+  - {name: BleepingComputer, url: "https://www.bleepingcomputer.com/feed/"}
+  - {name: CISA Advisories, url: "https://www.cisa.gov/cybersecurity-advisories/all.xml"}
+  - {name: SANS ISC, url: "https://isc.sans.edu/rssfeed_full.xml"}
+  - {name: Project Zero, url: "https://googleprojectzero.blogspot.com/feeds/posts/default"}
+  - {name: The DFIR Report, url: "https://thedfirreport.com/feed/"}
+  - {name: Unit 42, url: "https://unit42.paloaltonetworks.com/feed/"}
+  - {name: Schneier, url: "https://www.schneier.com/feed/atom/"}
+  - {name: Dark Reading, url: "https://www.darkreading.com/rss.xml"}
