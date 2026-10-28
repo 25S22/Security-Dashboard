@@ -1,103 +1,46 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Secdash</title>
-<style>
-:root{color-scheme:dark;--bg:#0b101a;--panel:#111826;--fg:#dde4f0;--mut:#8a97ae;--bd:#222d42;--link:#7db4ff;
---h0:#2a3750;--h1:#b8901a;--h2:#cf6a1c;--h3:#d6454b;--tag:#1c2638;--ok:#4fb477}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
-:focus-visible{outline:2px solid var(--link);outline-offset:2px}
-header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--bd);background:var(--panel);flex-wrap:wrap}
-h1{font-size:18px;margin:0;font-weight:700}
-button{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:6px 12px;cursor:pointer}
-button:hover{border-color:var(--link)}button[aria-pressed=true]{background:var(--link);color:#0b101a;border-color:var(--link)}
-main{max-width:1040px;margin:0 auto;padding:16px}
-.stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-.stat{flex:1 1 130px;background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:10px 12px}
-.stat b{display:block;font-size:24px;line-height:1.1}.stat span{color:var(--mut);font-size:13px}
-.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
-input{font:inherit;flex:1 1 200px;padding:7px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--panel);color:var(--fg)}
-.row{display:flex;gap:12px;background:var(--panel);border:1px solid var(--bd);border-radius:6px;margin-bottom:8px;overflow:hidden}
-.sc{flex:0 0 58px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:#fff}
-.b{padding:10px 12px 10px 0;min-width:0;flex:1}.b.pl{padding-left:12px}
-.t{font-weight:600;display:flex;gap:6px;flex-wrap:wrap;align-items:center;overflow-wrap:anywhere}
-.d{margin:3px 0;overflow-wrap:anywhere}.m{color:var(--mut);font-size:13px;overflow-wrap:anywhere}
-.tag{font-size:12px;font-weight:600;background:var(--tag);border-radius:4px;padding:1px 6px}
-.tag.kev{background:var(--h3);color:#fff}.tag.arm{background:var(--h2);color:#fff}.tag.new{background:var(--link);color:#0b101a}.tag.w{background:var(--h1);color:#0b101a}
-pre{background:var(--panel);border:1px solid var(--bd);border-radius:6px;padding:12px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
-footer{color:var(--mut);font-size:13px;margin-top:18px;line-height:1.7}.bad{color:var(--h3)}.skip{color:var(--mut)}.good{color:var(--ok)}
-.empty{padding:30px;text-align:center;color:var(--mut)}
-</style></head><body>
-<header><h1>Secdash</h1><div><span id="busy" class="m"></span> <button id="rf">Refresh data</button></div></header>
-<main>
-<div class="stats" id="stats"></div>
-<div class="bar" id="tabs" role="tablist"></div>
-<div class="bar" id="ctl"><input id="q" type="search" aria-label="Search"><span id="chips"></span></div>
-<div id="list"></div>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="logo">◢ SECDASH</span>
+  <nav id="nav" aria-label="Pages">
+    <button data-page="overview">Overview</button>
+    <button data-page="intel">Repos &amp; Exploits</button>
+    <button data-page="rf">Recorded Future</button>
+    <button data-page="search">Search</button>
+  </nav>
+  <span class="live" id="live"><span id="lt">CONNECTING</span></span>
+  <span class="grow"></span>
+  <span class="quota" id="ghq"></span>
+  <button class="btn" id="mine" title="Only show items that match the keywords in config.py">My stack</button>
+  <button class="btn" id="brief">Brief</button>
+  <button class="btn" id="rf" title="Refresh every source now">↻ Refresh</button>
+</header>
+<main id="main"><div class="empty">Loading live data…</div></main>
 <footer id="foot"></footer>
-</main>
-<script>
-const $=s=>document.querySelector(s);
-const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const safe=u=>/^https?:\/\//i.test(u)?u:"#";
-const api=async(p,o)=>{const r=await fetch(p,o);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);return j};
-const heat=s=>s>=75?"--h3":s>=50?"--h2":s>=25?"--h1":"--h0";
-let tab="cves",flt="";
-const TABS={cves:"Vulnerabilities",ransom:"Ransomware",iocs:"Indicators",deps:"My dependencies",tools:"New tools",news:"News",ip:"IP lookup"};
-const CH=[["","All"],["new","New this launch"],["kev","Exploited (KEV)"],["exploit","Public exploit"],["ransom","Ransomware-linked"],["watch","My stack"]];
-const PH={cves:"Search CVE, vendor, keyword",ip:"Public IP address, e.g. 8.8.8.8"};
-const tag=(c,t)=>`<span class="tag ${c}">${t}</span>`;
-
-function drawTabs(){
-  $("#tabs").innerHTML=Object.entries(TABS).map(([k,v])=>`<button role="tab" aria-pressed="${k==tab}" data-t="${k}">${v}</button>`).join("");
-  $("#chips").innerHTML=tab=="cves"?CH.map(([k,v])=>`<button aria-pressed="${k==flt}" data-f="${k}">${v}</button>`).join(" "):tab=="ip"?'<button id="go">Look up</button>':"";
-  $("#q").style.display=PH[tab]?"":"none";$("#q").placeholder=PH[tab]||"";
-}
-$("#tabs").onclick=e=>{const t=e.target.dataset.t;if(t){tab=t;flt="";$("#q").value="";drawTabs();load()}};
-$("#chips").onclick=e=>{if(e.target.dataset.f!==undefined){flt=e.target.dataset.f;drawTabs();load()}if(e.target.id=="go")load()};
-let tm;$("#q").oninput=()=>{if(tab=="cves"){clearTimeout(tm);tm=setTimeout(load,250)}};
-$("#q").onkeydown=e=>{if(e.key=="Enter"&&tab=="ip")load()};
-$("#rf").onclick=async()=>{await api("/api/refresh",{method:"POST"});poll()};
-
-const N=r=>r.new?tag("new","New"):"";
-const R={
-cves:r=>`<div class="row"><div class="sc" style="background:var(${heat(r.score)})">${Math.round(r.score)}</div><div class="b">
-<div class="t"><a href="https://nvd.nist.gov/vuln/detail/${esc(r.id)}" target="_blank" rel="noopener">${esc(r.id)}</a>
-${r.kev?tag("kev","Exploited"):""}${r.ransomware?tag("kev","Ransomware"):""}${r.metasploit?tag("arm","Metasploit"):""}${r.nuclei?tag("arm","Nuclei"):""}${r.exploit_db?tag("arm","Exploit-DB"):""}
-${N(r)}${r.watch?tag("w","My stack"):""}${r.mentions?tag("",r.mentions+" news"):""}</div>
-<div class="d">${esc((r.descr||"No description yet").slice(0,260))}</div>
-<div class="m">CVSS ${r.cvss??"–"} · EPSS ${(r.epss*100).toFixed(1)}% · ${esc(r.vendors||"vendor unknown")}${r.kev_due?` · patch by ${esc(r.kev_due)}`:""}</div></div></div>`,
-ransom:r=>`<div class="row"><div class="b pl"><div class="t">${esc(r.victim)} ${N(r)}</div><div class="m">${esc(r.grp)} · ${esc(r.country||"")} · ${esc(r.sector||"")} · ${esc(r.discovered)}</div></div></div>`,
-iocs:r=>`<div class="row"><div class="b pl"><div class="t">${esc(r.value)} ${N(r)}</div><div class="m">${esc(r.source)} · ${esc(r.ioc_type)} · ${esc(r.malware||"unknown family")} · ${esc(r.seen||"")}</div></div></div>`,
-deps:r=>`<div class="row"><div class="b pl"><div class="t">${esc(r.pkg)} ${esc(r.version)} <a href="https://osv.dev/vulnerability/${esc(r.vuln)}" target="_blank" rel="noopener">${esc(r.vuln)}</a> ${N(r)}</div>
-<div class="d">${esc(r.summary||"")}</div><div class="m">${esc(r.ecosystem)} · ${esc(r.cves||"no CVE alias")} · ${esc(r.published||"")}</div></div></div>`,
-tools:r=>`<div class="row"><div class="sc" style="background:var(--h0);font-size:15px">${r.stars}★</div><div class="b">
-<div class="t"><a href="${esc(safe(r.url))}" target="_blank" rel="noopener">${esc(r.repo)}</a>${N(r)}</div><div class="d">${esc(r.descr||"")}</div>
-<div class="m">${r.per_day.toFixed(1)} stars/day · ${r.gained>0?`+${r.gained} since tracked · `:""}${esc(r.lang||"")} · created ${esc(r.created)} · pushed ${esc(r.pushed)}</div></div></div>`,
-news:r=>`<div class="row"><div class="b pl"><div class="t"><a href="${esc(safe(r.url))}" target="_blank" rel="noopener">${esc(r.title)}</a>${N(r)}</div><div class="m">${esc(r.source)} · ${esc(r.published)}</div></div></div>`};
-const URL_={cves:()=>`/api/cves?f=${flt}&q=${encodeURIComponent($("#q").value)}`,ransom:()=>"/api/ransom",iocs:()=>"/api/iocs",deps:()=>"/api/deps",tools:()=>"/api/tools",news:()=>"/api/news"};
-const HINT={ransom:"Needs a free ransomware.live key (see config.yaml).",iocs:"Feodo works without a key. ThreatFox and URLhaus need a free abuse.ch key.",deps:"Add your packages to config.yaml to check them against OSV."};
-
-async function load(){
-  const L=$("#list");
-  try{
-    if(tab=="ip"){const ip=$("#q").value.trim();if(!ip){L.innerHTML='<div class="empty">Enter a public IP address.</div>';return}
-      L.innerHTML='<div class="empty">Looking up…</div>';L.innerHTML="<pre>"+esc(JSON.stringify(await api("/api/lookup/"+encodeURIComponent(ip)),null,2))+"</pre>";return}
-    const rows=await api(URL_[tab]());
-    L.innerHTML=rows.length?rows.map(R[tab]).join(""):`<div class="empty">Nothing here yet. ${esc(HINT[tab]||"If this is the first launch, data is still loading. Try Refresh data in a minute.")}</div>`;
-  }catch(e){L.innerHTML=`<div class="empty bad">${esc(e.message)}</div>`}
-}
-const IC={green:"var(--ok)",yellow:"var(--h1)",orange:"var(--h2)",red:"var(--h3)"};
-async function stats(){
-  const o=await api("/api/overview");
-  $("#stats").innerHTML=[["new","New this launch"],["kev","Known exploited"],["armed","Exploited + public exploit"],["watch","Hits on my stack"]].map(([k,v])=>`<div class="stat"><b>${o[k]}</b><span>${v}</span></div>`).join("")+
-   `<div class="stat"><b style="color:${IC[o.infocon]||"inherit"}">${esc(o.infocon)}</b><span>SANS InfoCon</span></div>`;
-  $("#busy").textContent=o.refreshing?"Updating…":"";
-  $("#foot").innerHTML="Sources: "+o.status.map(s=>`<span class="${["bad","good","skip"][s.ok]}" title="${esc(s.msg)}">${esc(s.src)}${s.ok==1?" ✓":s.ok==2?" (skipped: "+esc(s.msg)+")":" failed: "+esc(s.msg)}</span>`).join("<br>");
-  return o.refreshing}
-async function poll(){const busy=await stats();if(busy)setTimeout(poll,4000);else load()}
-drawTabs();load();poll();setInterval(()=>stats().catch(()=>{}),60000);
-</script></body></html>
+<div class="toast" id="toast" role="status"></div>
+<div id="dlg" role="dialog" aria-modal="true" aria-label="Threat brief">
+  <div class="dbox">
+    <div class="drow">
+      <b>Threat brief</b><span class="grow"></span>
+      <button class="btn" id="cmd">Copy Markdown</button>
+      <button class="btn" id="csl">Copy for Slack</button>
+      <a class="btn" href="/api/export?fmt=csv&amp;dl=1" download>CSV</a>
+      <a class="btn" href="/api/export?fmt=json&amp;dl=1" download>JSON</a>
+      <a class="btn" href="/api/export?fmt=md&amp;dl=1" download>.md</a>
+      <button class="btn" id="cls">Close</button>
+    </div>
+    <textarea id="bt" readonly aria-label="Brief text"></textarea>
+  </div>
+</div>
+<script src="/static/vendor/d3.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
